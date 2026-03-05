@@ -22,10 +22,11 @@ app.add_middleware(
 # ==========================================
 # DATABASE ARCHITECTURE
 # ==========================================
-SQLALCHEMY_DATABASE_URL = "sqlite:///./rahisipay.db"
+# Permanent Cloud PostgreSQL Connection
+SQLALCHEMY_DATABASE_URL = "postgresql://neondb_owner:npg_MjpkCf1owE0r@ep-purple-math-ag1abrl2-pooler.c-2.eu-central-1.aws.neon.tech/neondb?sslmode=require&channel_binding=require"
 
-# Create the SQLite engine
-engine = create_engine(SQLALCHEMY_DATABASE_URL, connect_args={"check_same_thread": False})
+# Create the engine (No 'connect_args' needed for Postgres)
+engine = create_engine(SQLALCHEMY_DATABASE_URL)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
 
