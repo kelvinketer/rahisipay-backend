@@ -1,7 +1,7 @@
 from fastapi import FastAPI, HTTPException, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from typing import Optional
+from typing import Optional, List
 import requests
 import os
 import random 
@@ -13,7 +13,7 @@ from sqlalchemy import create_engine, Column, Integer, String, Float, ForeignKey
 from sqlalchemy.orm import sessionmaker, Session, declarative_base
 
 # Initialize the Oletai Agri Finance Core API
-app = FastAPI(title="Oletai Agri Finance Bank Core API", version="6.0")
+app = FastAPI(title="Oletai Agri Finance Bank Core API", version="7.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -43,7 +43,6 @@ engine = create_engine(SQLALCHEMY_DATABASE_URL)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
 
-# --- TABLE 1: THE GLOBAL FARMER LEDGER ---
 class FarmerDB(Base):
     __tablename__ = "farmers"
     id = Column(Integer, primary_key=True, index=True)
@@ -52,8 +51,6 @@ class FarmerDB(Base):
     farm_size_acres = Column(Float)
     trust_score = Column(Float)
     approved_limit = Column(Integer)
-    
-    # --- NEW: GLOBAL SCALABILITY FIELDS ---
     country_code = Column(String, default="KE")
     preferred_language = Column(String, default="en")
     base_currency = Column(String, default="KES")
@@ -62,10 +59,8 @@ class FarmerDB(Base):
     id_document_url = Column(String, nullable=True)
     email_address = Column(String, nullable=True)
     region_climate_zone = Column(String, default="East African Highlands")
-    
     created_at = Column(DateTime, default=datetime.utcnow)
 
-# --- TABLE 2: THE TRANSACTION LEDGER ---
 class TransactionDB(Base):
     __tablename__ = "transactions"
     id = Column(Integer, primary_key=True, index=True)
@@ -76,7 +71,6 @@ class TransactionDB(Base):
     facility_fee = Column(Integer)
     timestamp = Column(DateTime, default=datetime.utcnow)
 
-# --- TABLE 3: THE OTP VAULT ---
 class OTPStoreDB(Base):
     __tablename__ = "otp_store"
     id = Column(Integer, primary_key=True, index=True)
@@ -84,7 +78,6 @@ class OTPStoreDB(Base):
     otp_code = Column(String)
     expires_at = Column(DateTime)
 
-# Generate tables
 Base.metadata.create_all(bind=engine)
 
 def get_db():
@@ -109,7 +102,6 @@ class LoanRequest(BaseModel):
     crop_type: str
     farm_size_acres: float
     repayment_history_multiplier: float = 1.0
-    
     country_code: str = "KE"
     preferred_language: str = "en"
     base_currency: str = "KES"
@@ -121,6 +113,10 @@ class DisburseRequest(BaseModel):
     phone_number: str
     till_number: str
     amount_kes: int
+
+class RepayRequest(BaseModel):
+    phone_number: str
+    amount: int
 
 # ==========================================
 # CORE ALGORITHMS
@@ -142,13 +138,10 @@ def calculate_score(crop: str, acres: float, history_mult: float):
     elif 41 <= trust_score <= 70: return {"tier": "Tier 2: Growth", "amount": 10000, "fee": 800, "score": trust_score}
     else: return {"tier": "Tier 3: Harvest", "amount": 50000, "fee": 4000, "score": trust_score}
 
-def trigger_mpesa_b2b(amount: int, till_number: str, farmer_phone: str):
-    transaction_ref = f"OLETAI_{datetime.now().strftime('%Y%m%d%H%M%S')}"
-    return transaction_ref
+# ==========================================
+# ENDPOINTS
+# ==========================================
 
-# ==========================================
-# SECURITY ENDPOINTS (OTP)
-# ==========================================
 @app.post("/api/v1/auth/send-otp")
 async def send_otp(request: SendOTPRequest, db: Session = Depends(get_db)):
     try:
@@ -157,10 +150,7 @@ async def send_otp(request: SendOTPRequest, db: Session = Depends(get_db)):
         new_otp = OTPStoreDB(phone_number=request.phone_number, otp_code=code, expires_at=expiry)
         db.add(new_otp)
         db.commit()
-        
-        message = f"Welcome to Oletai Agri Finance! Your verification code is: {code}. Do not share this PIN."
-        sms.send(message, [request.phone_number])
-        
+        sms.send(f"Welcome to Oletai Agri Finance! Code: {code}", [request.phone_number])
         return {"status": "success", "message": "OTP sent successfully"}
     except Exception as e:
         db.rollback()
@@ -168,97 +158,65 @@ async def send_otp(request: SendOTPRequest, db: Session = Depends(get_db)):
 
 @app.post("/api/v1/auth/verify-otp")
 async def verify_otp(request: VerifyOTPRequest, db: Session = Depends(get_db)):
-    valid_otp = db.query(OTPStoreDB).filter(
-        OTPStoreDB.phone_number == request.phone_number,
-        OTPStoreDB.otp_code == request.otp_code,
-        OTPStoreDB.expires_at > datetime.utcnow()
-    ).first()
-    
+    valid_otp = db.query(OTPStoreDB).filter(OTPStoreDB.phone_number == request.phone_number, OTPStoreDB.otp_code == request.otp_code, OTPStoreDB.expires_at > datetime.utcnow()).first()
     if not valid_otp:
-        raise HTTPException(status_code=400, detail="Invalid or expired OTP code")
-    
+        raise HTTPException(status_code=400, detail="Invalid PIN")
     farmer = db.query(FarmerDB).filter(FarmerDB.phone_number == request.phone_number).first()
     db.delete(valid_otp)
     db.commit()
-    
-    if farmer:
-        return {"status": "success", "is_new_user": False, "score": farmer.trust_score, "limit": farmer.approved_limit}
-    else:
-        return {"status": "success", "is_new_user": True}
+    return {"status": "success", "is_new_user": farmer is None, "score": farmer.trust_score if farmer else 0, "limit": farmer.approved_limit if farmer else 0}
 
-# ==========================================
-# NEW: LIVE TRANSACTION HISTORY ENDPOINT
-# ==========================================
 @app.get("/api/v1/transactions/{phone_number}")
 async def get_transaction_history(phone_number: str, db: Session = Depends(get_db)):
-    try:
-        history = db.query(TransactionDB).filter(
-            TransactionDB.farmer_phone == phone_number
-        ).order_by(TransactionDB.timestamp.desc()).all()
-        
-        return [
-            {
-                "id": tx.id,
-                "title": f"Agrovet Payment (Till {tx.till_number})",
-                "date": tx.timestamp.strftime("%b %d, %I:%M %p"),
-                "amount": f"- KES {tx.amount_kes}",
-                "is_credit": False
-            } for tx in history
-        ]
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    history = db.query(TransactionDB).filter(TransactionDB.farmer_phone == phone_number).order_by(TransactionDB.timestamp.desc()).all()
+    return [
+        {
+            "id": tx.id,
+            "title": "Loan Repayment" if tx.till_number == "OLETAI_BANK" else f"Agrovet Payment (Till {tx.till_number})",
+            "date": tx.timestamp.strftime("%b %d, %I:%M %p"),
+            "amount": f"{'+' if tx.till_number == 'OLETAI_BANK' else '-'} KES {tx.amount_kes}",
+            "is_credit": tx.till_number == "OLETAI_BANK"
+        } for tx in history
+    ]
 
-# ==========================================
-# FINTECH ENDPOINTS
-# ==========================================
 @app.post("/api/v1/apply-loan")
 async def apply_for_loan(request: LoanRequest, db: Session = Depends(get_db)):
-    try:
-        decision = calculate_score(request.crop_type, request.farm_size_acres, request.repayment_history_multiplier)
-        
-        farmer = db.query(FarmerDB).filter(FarmerDB.phone_number == request.phone_number).first()
-        if not farmer:
-            farmer = FarmerDB(
-                phone_number=request.phone_number, 
-                crop_type=request.crop_type, 
-                farm_size_acres=request.farm_size_acres, 
-                trust_score=decision["score"], 
-                approved_limit=decision["amount"],
-                country_code=request.country_code,
-                preferred_language=request.preferred_language,
-                base_currency=request.base_currency,
-                measurement_unit=request.measurement_unit,
-                email_address=request.email_address,
-                region_climate_zone=request.region_climate_zone
-            )
-            db.add(farmer)
-        else:
-            farmer.trust_score = decision["score"]
-            farmer.approved_limit = decision["amount"]
-            
-        db.commit()
-        return {"status": "success", "farmer": request.phone_number, "decision": decision}
-    except Exception as e:
-        db.rollback()
-        raise HTTPException(status_code=500, detail=str(e))
+    decision = calculate_score(request.crop_type, request.farm_size_acres, request.repayment_history_multiplier)
+    farmer = db.query(FarmerDB).filter(FarmerDB.phone_number == request.phone_number).first()
+    if not farmer:
+        farmer = FarmerDB(phone_number=request.phone_number, crop_type=request.crop_type, farm_size_acres=request.farm_size_acres, trust_score=decision["score"], approved_limit=decision["amount"])
+        db.add(farmer)
+    else:
+        farmer.trust_score = decision["score"]
+        farmer.approved_limit = decision["amount"]
+    db.commit()
+    return {"status": "success", "decision": decision}
 
 @app.post("/api/v1/disburse")
 async def disburse_funds(request: DisburseRequest, db: Session = Depends(get_db)):
+    receipt_code = f"OLETAI_{datetime.now().strftime('%Y%m%d%H%M%S')}"
+    new_tx = TransactionDB(mpesa_receipt=receipt_code, farmer_phone=request.phone_number, till_number=request.till_number, amount_kes=request.amount_kes, facility_fee=int(request.amount_kes * 0.08))
+    db.add(new_tx)
+    db.commit()
+    return {"status": "success", "mpesa_receipt": receipt_code}
+
+@app.post("/api/v1/repay")
+async def repay_loan(request: RepayRequest, db: Session = Depends(get_db)):
     try:
-        receipt_code = trigger_mpesa_b2b(request.amount_kes, request.till_number, request.phone_number)
-        fee = int(request.amount_kes * 0.08)
+        farmer = db.query(FarmerDB).filter(FarmerDB.phone_number == request.phone_number).first()
+        if not farmer:
+            raise HTTPException(status_code=404, detail="Farmer not found")
         
-        new_transaction = TransactionDB(
-            mpesa_receipt=receipt_code, 
-            farmer_phone=request.phone_number, 
-            till_number=request.till_number, 
-            amount_kes=request.amount_kes, 
-            facility_fee=fee
-        )
-        db.add(new_transaction)
+        # Record Repayment
+        repayment_ref = f"REPAY_{datetime.now().strftime('%Y%m%d%H%M%S')}"
+        new_tx = TransactionDB(mpesa_receipt=repayment_ref, farmer_phone=request.phone_number, till_number="OLETAI_BANK", amount_kes=request.amount, facility_fee=0)
+        db.add(new_tx)
+
+        # Boost Trust Score (Rewards positive behavior)
+        farmer.trust_score = min(farmer.trust_score + 5.0, 100.0)
         db.commit()
-        
-        return {"status": "success", "disbursement": {"mpesa_receipt": receipt_code, "amount": request.amount_kes, "till_number": request.till_number}}
+
+        return {"status": "success", "message": f"Repayment of KES {request.amount} confirmed.", "new_score": farmer.trust_score}
     except Exception as e:
         db.rollback()
         raise HTTPException(status_code=500, detail=str(e))
