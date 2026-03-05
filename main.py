@@ -2,6 +2,7 @@ from fastapi import FastAPI, HTTPException, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import requests
+import os # <-- NEW: Added to read environment variables securely
 from datetime import datetime
 
 # --- NEW: SQLALCHEMY DATABASE IMPORTS ---
@@ -22,8 +23,12 @@ app.add_middleware(
 # ==========================================
 # DATABASE ARCHITECTURE
 # ==========================================
-# Permanent Cloud PostgreSQL Connection
-SQLALCHEMY_DATABASE_URL = "postgresql://neondb_owner:npg_MjpkCf1owE0r@ep-purple-math-ag1abrl2-pooler.c-2.eu-central-1.aws.neon.tech/neondb?sslmode=require&channel_binding=require"
+# Fetch the secure URL from Render's Environment Variables
+SQLALCHEMY_DATABASE_URL = os.getenv("DATABASE_URL")
+
+# Safety check to ensure the variable loaded correctly
+if not SQLALCHEMY_DATABASE_URL:
+    raise ValueError("FATAL ERROR: DATABASE_URL environment variable is not set!")
 
 # Create the engine (No 'connect_args' needed for Postgres)
 engine = create_engine(SQLALCHEMY_DATABASE_URL)
@@ -170,4 +175,3 @@ async def disburse_funds(request: DisburseRequest, db: Session = Depends(get_db)
     except Exception as e:
         db.rollback()
         raise HTTPException(status_code=500, detail=str(e))
-    
