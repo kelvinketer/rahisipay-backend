@@ -1,18 +1,19 @@
 from fastapi import FastAPI, HTTPException, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
+from typing import Optional
 import requests
 import os
-import random # <-- NEW: For generating the 4-digit OTP
-import africastalking # <-- NEW: SMS Engine
+import random 
+import africastalking 
 from datetime import datetime, timedelta
 
 # --- SQLALCHEMY DATABASE IMPORTS ---
 from sqlalchemy import create_engine, Column, Integer, String, Float, ForeignKey, DateTime
 from sqlalchemy.orm import sessionmaker, Session, declarative_base
 
-# Initialize the RahisiPay API
-app = FastAPI(title="RahisiPay Core API", version="4.0")
+# Initialize the Oletai Agri Finance Core API
+app = FastAPI(title="Oletai Agri Finance Bank Core API", version="5.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -42,7 +43,7 @@ engine = create_engine(SQLALCHEMY_DATABASE_URL)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
 
-# --- TABLE 1: THE FARMER LEDGER ---
+# --- TABLE 1: THE GLOBAL FARMER LEDGER ---
 class FarmerDB(Base):
     __tablename__ = "farmers"
     id = Column(Integer, primary_key=True, index=True)
@@ -51,6 +52,17 @@ class FarmerDB(Base):
     farm_size_acres = Column(Float)
     trust_score = Column(Float)
     approved_limit = Column(Integer)
+    
+    # --- NEW: GLOBAL SCALABILITY FIELDS ---
+    country_code = Column(String, default="KE")
+    preferred_language = Column(String, default="en")
+    base_currency = Column(String, default="KES")
+    measurement_unit = Column(String, default="acres")
+    national_id_type = Column(String, nullable=True)
+    id_document_url = Column(String, nullable=True)
+    email_address = Column(String, nullable=True)
+    region_climate_zone = Column(String, default="East African Highlands")
+    
     created_at = Column(DateTime, default=datetime.utcnow)
 
 # --- TABLE 2: THE TRANSACTION LEDGER ---
@@ -64,7 +76,7 @@ class TransactionDB(Base):
     facility_fee = Column(Integer)
     timestamp = Column(DateTime, default=datetime.utcnow)
 
-# --- NEW TABLE 3: THE OTP VAULT ---
+# --- TABLE 3: THE OTP VAULT ---
 class OTPStoreDB(Base):
     __tablename__ = "otp_store"
     id = Column(Integer, primary_key=True, index=True)
@@ -97,6 +109,14 @@ class LoanRequest(BaseModel):
     crop_type: str
     farm_size_acres: float
     repayment_history_multiplier: float = 1.0
+    
+    # --- NEW: GLOBAL SCALABILITY FIELDS (With defaults for backward compatibility) ---
+    country_code: str = "KE"
+    preferred_language: str = "en"
+    base_currency: str = "KES"
+    measurement_unit: str = "acres"
+    email_address: Optional[str] = None
+    region_climate_zone: str = "East African Highlands"
 
 class DisburseRequest(BaseModel):
     phone_number: str
@@ -124,7 +144,7 @@ def calculate_score(crop: str, acres: float, history_mult: float):
     else: return {"tier": "Tier 3: Harvest", "amount": 50000, "fee": 4000, "score": trust_score}
 
 def trigger_mpesa_b2b(amount: int, till_number: str, farmer_phone: str):
-    transaction_ref = f"RAHISI_{datetime.now().strftime('%Y%m%d%H%M%S')}"
+    transaction_ref = f"OLETAI_{datetime.now().strftime('%Y%m%d%H%M%S')}"
     return transaction_ref
 
 # ==========================================
@@ -133,19 +153,14 @@ def trigger_mpesa_b2b(amount: int, till_number: str, farmer_phone: str):
 @app.post("/api/v1/auth/send-otp")
 async def send_otp(request: SendOTPRequest, db: Session = Depends(get_db)):
     try:
-        # 1. Generate a secure 4-digit code
         code = str(random.randint(1000, 9999))
-        
-        # 2. Set expiration (10 minutes from now)
         expiry = datetime.utcnow() + timedelta(minutes=10)
         
-        # 3. Save to database vault
         new_otp = OTPStoreDB(phone_number=request.phone_number, otp_code=code, expires_at=expiry)
         db.add(new_otp)
         db.commit()
         
-        # 4. Dispatch SMS via Africa's Talking
-        message = f"Welcome to Rahisi Agro Pay! Your verification code is: {code}. Do not share this PIN."
+        message = f"Welcome to Oletai Agri Finance! Your verification code is: {code}. Do not share this PIN."
         sms.send(message, [request.phone_number])
         
         return {"status": "success", "message": "OTP sent successfully"}
@@ -155,7 +170,6 @@ async def send_otp(request: SendOTPRequest, db: Session = Depends(get_db)):
 
 @app.post("/api/v1/auth/verify-otp")
 async def verify_otp(request: VerifyOTPRequest, db: Session = Depends(get_db)):
-    # 1. Find the most recent unexpired OTP for this number
     valid_otp = db.query(OTPStoreDB).filter(
         OTPStoreDB.phone_number == request.phone_number,
         OTPStoreDB.otp_code == request.otp_code,
@@ -165,10 +179,8 @@ async def verify_otp(request: VerifyOTPRequest, db: Session = Depends(get_db)):
     if not valid_otp:
         raise HTTPException(status_code=400, detail="Invalid or expired OTP code")
     
-    # 2. Check if farmer already exists in the system to return their limits
     farmer = db.query(FarmerDB).filter(FarmerDB.phone_number == request.phone_number).first()
     
-    # 3. Delete the used OTP for security
     db.delete(valid_otp)
     db.commit()
     
@@ -187,7 +199,20 @@ async def apply_for_loan(request: LoanRequest, db: Session = Depends(get_db)):
         
         farmer = db.query(FarmerDB).filter(FarmerDB.phone_number == request.phone_number).first()
         if not farmer:
-            farmer = FarmerDB(phone_number=request.phone_number, crop_type=request.crop_type, farm_size_acres=request.farm_size_acres, trust_score=decision["score"], approved_limit=decision["amount"])
+            farmer = FarmerDB(
+                phone_number=request.phone_number, 
+                crop_type=request.crop_type, 
+                farm_size_acres=request.farm_size_acres, 
+                trust_score=decision["score"], 
+                approved_limit=decision["amount"],
+                # Mapping the new global fields
+                country_code=request.country_code,
+                preferred_language=request.preferred_language,
+                base_currency=request.base_currency,
+                measurement_unit=request.measurement_unit,
+                email_address=request.email_address,
+                region_climate_zone=request.region_climate_zone
+            )
             db.add(farmer)
         else:
             farmer.trust_score = decision["score"]
@@ -213,3 +238,4 @@ async def disburse_funds(request: DisburseRequest, db: Session = Depends(get_db)
     except Exception as e:
         db.rollback()
         raise HTTPException(status_code=500, detail=str(e))
+    
