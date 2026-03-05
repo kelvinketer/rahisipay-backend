@@ -2,15 +2,17 @@ from fastapi import FastAPI, HTTPException, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import requests
-import os # <-- NEW: Added to read environment variables securely
-from datetime import datetime
+import os
+import random # <-- NEW: For generating the 4-digit OTP
+import africastalking # <-- NEW: SMS Engine
+from datetime import datetime, timedelta
 
-# --- NEW: SQLALCHEMY DATABASE IMPORTS ---
+# --- SQLALCHEMY DATABASE IMPORTS ---
 from sqlalchemy import create_engine, Column, Integer, String, Float, ForeignKey, DateTime
 from sqlalchemy.orm import sessionmaker, Session, declarative_base
 
 # Initialize the RahisiPay API
-app = FastAPI(title="RahisiPay Core API", version="3.0")
+app = FastAPI(title="RahisiPay Core API", version="4.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -21,16 +23,21 @@ app.add_middleware(
 )
 
 # ==========================================
+# SMS ENGINE INITIALIZATION
+# ==========================================
+AT_USERNAME = os.getenv("AT_USERNAME", "sandbox")
+AT_API_KEY = os.getenv("AT_API_KEY", "your_api_key")
+
+africastalking.initialize(username=AT_USERNAME, api_key=AT_API_KEY)
+sms = africastalking.SMS
+
+# ==========================================
 # DATABASE ARCHITECTURE
 # ==========================================
-# Fetch the secure URL from Render's Environment Variables
 SQLALCHEMY_DATABASE_URL = os.getenv("DATABASE_URL")
-
-# Safety check to ensure the variable loaded correctly
 if not SQLALCHEMY_DATABASE_URL:
     raise ValueError("FATAL ERROR: DATABASE_URL environment variable is not set!")
 
-# Create the engine (No 'connect_args' needed for Postgres)
 engine = create_engine(SQLALCHEMY_DATABASE_URL)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
@@ -57,10 +64,17 @@ class TransactionDB(Base):
     facility_fee = Column(Integer)
     timestamp = Column(DateTime, default=datetime.utcnow)
 
-# Generate the tables in the database file
+# --- NEW TABLE 3: THE OTP VAULT ---
+class OTPStoreDB(Base):
+    __tablename__ = "otp_store"
+    id = Column(Integer, primary_key=True, index=True)
+    phone_number = Column(String, index=True)
+    otp_code = Column(String)
+    expires_at = Column(DateTime)
+
+# Generate tables
 Base.metadata.create_all(bind=engine)
 
-# Dependency to get the database session
 def get_db():
     db = SessionLocal()
     try:
@@ -68,10 +82,16 @@ def get_db():
     finally:
         db.close()
 
+# ==========================================
+# DATA MODELS
+# ==========================================
+class SendOTPRequest(BaseModel):
+    phone_number: str
 
-# ==========================================
-# DATA MODELS (FLUTTER TO PYTHON)
-# ==========================================
+class VerifyOTPRequest(BaseModel):
+    phone_number: str
+    otp_code: str
+
 class LoanRequest(BaseModel):
     phone_number: str
     crop_type: str
@@ -82,7 +102,6 @@ class DisburseRequest(BaseModel):
     phone_number: str
     till_number: str
     amount_kes: int
-
 
 # ==========================================
 # CORE ALGORITHMS
@@ -106,72 +125,91 @@ def calculate_score(crop: str, acres: float, history_mult: float):
 
 def trigger_mpesa_b2b(amount: int, till_number: str, farmer_phone: str):
     transaction_ref = f"RAHISI_{datetime.now().strftime('%Y%m%d%H%M%S')}"
-    print(f"\n[DARAJA API ALERT] B2B Transfer Executed -> Ref: {transaction_ref}")
     return transaction_ref
 
+# ==========================================
+# SECURITY ENDPOINTS (OTP)
+# ==========================================
+@app.post("/api/v1/auth/send-otp")
+async def send_otp(request: SendOTPRequest, db: Session = Depends(get_db)):
+    try:
+        # 1. Generate a secure 4-digit code
+        code = str(random.randint(1000, 9999))
+        
+        # 2. Set expiration (10 minutes from now)
+        expiry = datetime.utcnow() + timedelta(minutes=10)
+        
+        # 3. Save to database vault
+        new_otp = OTPStoreDB(phone_number=request.phone_number, otp_code=code, expires_at=expiry)
+        db.add(new_otp)
+        db.commit()
+        
+        # 4. Dispatch SMS via Africa's Talking
+        message = f"Welcome to Rahisi Agro Pay! Your verification code is: {code}. Do not share this PIN."
+        sms.send(message, [request.phone_number])
+        
+        return {"status": "success", "message": "OTP sent successfully"}
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/api/v1/auth/verify-otp")
+async def verify_otp(request: VerifyOTPRequest, db: Session = Depends(get_db)):
+    # 1. Find the most recent unexpired OTP for this number
+    valid_otp = db.query(OTPStoreDB).filter(
+        OTPStoreDB.phone_number == request.phone_number,
+        OTPStoreDB.otp_code == request.otp_code,
+        OTPStoreDB.expires_at > datetime.utcnow()
+    ).first()
+    
+    if not valid_otp:
+        raise HTTPException(status_code=400, detail="Invalid or expired OTP code")
+    
+    # 2. Check if farmer already exists in the system to return their limits
+    farmer = db.query(FarmerDB).filter(FarmerDB.phone_number == request.phone_number).first()
+    
+    # 3. Delete the used OTP for security
+    db.delete(valid_otp)
+    db.commit()
+    
+    if farmer:
+        return {"status": "success", "is_new_user": False, "score": farmer.trust_score, "limit": farmer.approved_limit}
+    else:
+        return {"status": "success", "is_new_user": True}
 
 # ==========================================
-# API ENDPOINTS (WITH DATABASE SAVING)
+# FINTECH ENDPOINTS
 # ==========================================
 @app.post("/api/v1/apply-loan")
 async def apply_for_loan(request: LoanRequest, db: Session = Depends(get_db)):
     try:
-        # 1. Run the scoring algorithm
         decision = calculate_score(request.crop_type, request.farm_size_acres, request.repayment_history_multiplier)
         
-        # 2. Check if farmer exists, otherwise create them
         farmer = db.query(FarmerDB).filter(FarmerDB.phone_number == request.phone_number).first()
         if not farmer:
-            farmer = FarmerDB(
-                phone_number=request.phone_number,
-                crop_type=request.crop_type,
-                farm_size_acres=request.farm_size_acres,
-                trust_score=decision["score"],
-                approved_limit=decision["amount"]
-            )
+            farmer = FarmerDB(phone_number=request.phone_number, crop_type=request.crop_type, farm_size_acres=request.farm_size_acres, trust_score=decision["score"], approved_limit=decision["amount"])
             db.add(farmer)
         else:
-            # Update existing farmer's limit
             farmer.trust_score = decision["score"]
             farmer.approved_limit = decision["amount"]
             
-        # 3. Save to database
         db.commit()
-        
         return {"status": "success", "farmer": request.phone_number, "decision": decision}
     except Exception as e:
         db.rollback()
         raise HTTPException(status_code=500, detail=str(e))
 
-
 @app.post("/api/v1/disburse")
 async def disburse_funds(request: DisburseRequest, db: Session = Depends(get_db)):
     try:
-        # 1. Trigger the Safaricom payment
         receipt_code = trigger_mpesa_b2b(request.amount_kes, request.till_number, request.phone_number)
-        
-        # 2. Calculate the 8% fee
         fee = int(request.amount_kes * 0.08)
         
-        # 3. Record the transaction in the Ledger
-        new_transaction = TransactionDB(
-            mpesa_receipt=receipt_code,
-            farmer_phone=request.phone_number,
-            till_number=request.till_number,
-            amount_kes=request.amount_kes,
-            facility_fee=fee
-        )
+        new_transaction = TransactionDB(mpesa_receipt=receipt_code, farmer_phone=request.phone_number, till_number=request.till_number, amount_kes=request.amount_kes, facility_fee=fee)
         db.add(new_transaction)
         db.commit()
         
-        return {
-            "status": "success", 
-            "disbursement": {
-                "mpesa_receipt": receipt_code,
-                "amount": request.amount_kes,
-                "till_number": request.till_number
-            }
-        }
+        return {"status": "success", "disbursement": {"mpesa_receipt": receipt_code, "amount": request.amount_kes, "till_number": request.till_number}}
     except Exception as e:
         db.rollback()
         raise HTTPException(status_code=500, detail=str(e))
