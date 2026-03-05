@@ -13,7 +13,7 @@ from sqlalchemy import create_engine, Column, Integer, String, Float, ForeignKey
 from sqlalchemy.orm import sessionmaker, Session, declarative_base
 
 # Initialize the Oletai Agri Finance Core API
-app = FastAPI(title="Oletai Agri Finance Bank Core API", version="7.0")
+app = FastAPI(title="Oletai Agri Finance Bank Core API", version="8.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -47,18 +47,13 @@ class FarmerDB(Base):
     __tablename__ = "farmers"
     id = Column(Integer, primary_key=True, index=True)
     phone_number = Column(String, unique=True, index=True)
-    crop_type = Column(String)
-    farm_size_acres = Column(Float)
+    user_segment = Column(String) # Replaces/Overloads crop_type
+    identifier = Column(String)    # Crop Type, Student ID, or Job Title
+    farm_size_acres = Column(Float, default=0.0)
     trust_score = Column(Float)
     approved_limit = Column(Integer)
     country_code = Column(String, default="KE")
-    preferred_language = Column(String, default="en")
     base_currency = Column(String, default="KES")
-    measurement_unit = Column(String, default="acres")
-    national_id_type = Column(String, nullable=True)
-    id_document_url = Column(String, nullable=True)
-    email_address = Column(String, nullable=True)
-    region_climate_zone = Column(String, default="East African Highlands")
     created_at = Column(DateTime, default=datetime.utcnow)
 
 class TransactionDB(Base):
@@ -99,15 +94,10 @@ class VerifyOTPRequest(BaseModel):
 
 class LoanRequest(BaseModel):
     phone_number: str
-    crop_type: str
-    farm_size_acres: float
+    user_segment: str = "Farmer" # "Farmer", "Student", or "Professional"
+    identifier: str              # e.g., "Avocado", "JKUAT-ID-123", "Software Engineer"
+    farm_size_acres: float = 0.0
     repayment_history_multiplier: float = 1.0
-    country_code: str = "KE"
-    preferred_language: str = "en"
-    base_currency: str = "KES"
-    measurement_unit: str = "acres"
-    email_address: Optional[str] = None
-    region_climate_zone: str = "East African Highlands"
 
 class DisburseRequest(BaseModel):
     phone_number: str
@@ -119,24 +109,24 @@ class RepayRequest(BaseModel):
     amount: int
 
 # ==========================================
-# CORE ALGORITHMS
+# MULTI-SEGMENT SCORING ALGORITHM
 # ==========================================
-def calculate_score(crop: str, acres: float, history_mult: float):
-    crop_scores = {"avocado": 10, "french_beans": 10, "coffee": 8, "maize": 4}
-    c_score = crop_scores.get(crop.lower(), 3)
-    
-    if acres >= 5.0: f_score = 10
-    elif acres >= 2.0: f_score = 7
-    elif acres >= 0.5: f_score = 5
-    else: f_score = 3
+def calculate_multi_segment_score(segment: str, identifier: str, units: float):
+    # Tiered Entry Points
+    if segment == "Student":
+        return {"tier": "Elimu Starter", "amount": 5000, "fee": 400, "score": 45.0}
+    elif segment == "Professional":
+        return {"tier": "Urban Maisha", "amount": 25000, "fee": 2000, "score": 65.0}
+    else: # Default: Farmer
+        crop_scores = {"avocado": 10, "coffee": 8, "maize": 4}
+        c_score = crop_scores.get(identifier.lower(), 3)
+        f_score = 10 if units >= 5.0 else 7 if units >= 2.0 else 5
+        base_score = (c_score * 0.6) + (f_score * 0.4)
+        trust_score = (base_score * 10)
         
-    base_score = (c_score * 0.6) + (f_score * 0.4)
-    trust_score = min((base_score * 10) * history_mult, 100)
-    
-    if trust_score < 20: return {"tier": "Rejected", "amount": 0, "fee": 0, "score": trust_score}
-    elif 20 <= trust_score <= 40: return {"tier": "Tier 1: Seed", "amount": 2500, "fee": 200, "score": trust_score}
-    elif 41 <= trust_score <= 70: return {"tier": "Tier 2: Growth", "amount": 10000, "fee": 800, "score": trust_score}
-    else: return {"tier": "Tier 3: Harvest", "amount": 50000, "fee": 4000, "score": trust_score}
+        if trust_score <= 40: return {"tier": "Tier 1: Seed", "amount": 2500, "fee": 200, "score": trust_score}
+        elif trust_score <= 70: return {"tier": "Tier 2: Growth", "amount": 10000, "fee": 800, "score": trust_score}
+        else: return {"tier": "Tier 3: Harvest", "amount": 50000, "fee": 4000, "score": trust_score}
 
 # ==========================================
 # ENDPOINTS
@@ -150,8 +140,8 @@ async def send_otp(request: SendOTPRequest, db: Session = Depends(get_db)):
         new_otp = OTPStoreDB(phone_number=request.phone_number, otp_code=code, expires_at=expiry)
         db.add(new_otp)
         db.commit()
-        sms.send(f"Welcome to Oletai Agri Finance! Code: {code}", [request.phone_number])
-        return {"status": "success", "message": "OTP sent successfully"}
+        sms.send(f"Welcome to Oletai Bank! Your PIN: {code}", [request.phone_number])
+        return {"status": "success", "message": "OTP sent"}
     except Exception as e:
         db.rollback()
         raise HTTPException(status_code=500, detail=str(e))
@@ -161,10 +151,36 @@ async def verify_otp(request: VerifyOTPRequest, db: Session = Depends(get_db)):
     valid_otp = db.query(OTPStoreDB).filter(OTPStoreDB.phone_number == request.phone_number, OTPStoreDB.otp_code == request.otp_code, OTPStoreDB.expires_at > datetime.utcnow()).first()
     if not valid_otp:
         raise HTTPException(status_code=400, detail="Invalid PIN")
-    farmer = db.query(FarmerDB).filter(FarmerDB.phone_number == request.phone_number).first()
+    user = db.query(FarmerDB).filter(FarmerDB.phone_number == request.phone_number).first()
     db.delete(valid_otp)
     db.commit()
-    return {"status": "success", "is_new_user": farmer is None, "score": farmer.trust_score if farmer else 0, "limit": farmer.approved_limit if farmer else 0}
+    return {"status": "success", "is_new_user": user is None, "score": user.trust_score if user else 0, "limit": user.approved_limit if user else 0}
+
+@app.post("/api/v1/apply-loan")
+async def apply_for_loan(request: LoanRequest, db: Session = Depends(get_db)):
+    try:
+        decision = calculate_multi_segment_score(request.user_segment, request.identifier, request.farm_size_acres)
+        user = db.query(FarmerDB).filter(FarmerDB.phone_number == request.phone_number).first()
+        
+        if not user:
+            user = FarmerDB(
+                phone_number=request.phone_number,
+                user_segment=request.user_segment,
+                identifier=request.identifier,
+                farm_size_acres=request.farm_size_acres,
+                trust_score=decision["score"],
+                approved_limit=decision["amount"]
+            )
+            db.add(user)
+        else:
+            user.trust_score = decision["score"]
+            user.approved_limit = decision["amount"]
+        
+        db.commit()
+        return {"status": "success", "decision": decision}
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/api/v1/transactions/{phone_number}")
 async def get_transaction_history(phone_number: str, db: Session = Depends(get_db)):
@@ -172,25 +188,12 @@ async def get_transaction_history(phone_number: str, db: Session = Depends(get_d
     return [
         {
             "id": tx.id,
-            "title": "Loan Repayment" if tx.till_number == "OLETAI_BANK" else f"Agrovet Payment (Till {tx.till_number})",
+            "title": "Loan Repayment" if tx.till_number == "OLETAI_BANK" else f"Payment (Till {tx.till_number})",
             "date": tx.timestamp.strftime("%b %d, %I:%M %p"),
             "amount": f"{'+' if tx.till_number == 'OLETAI_BANK' else '-'} KES {tx.amount_kes}",
             "is_credit": tx.till_number == "OLETAI_BANK"
         } for tx in history
     ]
-
-@app.post("/api/v1/apply-loan")
-async def apply_for_loan(request: LoanRequest, db: Session = Depends(get_db)):
-    decision = calculate_score(request.crop_type, request.farm_size_acres, request.repayment_history_multiplier)
-    farmer = db.query(FarmerDB).filter(FarmerDB.phone_number == request.phone_number).first()
-    if not farmer:
-        farmer = FarmerDB(phone_number=request.phone_number, crop_type=request.crop_type, farm_size_acres=request.farm_size_acres, trust_score=decision["score"], approved_limit=decision["amount"])
-        db.add(farmer)
-    else:
-        farmer.trust_score = decision["score"]
-        farmer.approved_limit = decision["amount"]
-    db.commit()
-    return {"status": "success", "decision": decision}
 
 @app.post("/api/v1/disburse")
 async def disburse_funds(request: DisburseRequest, db: Session = Depends(get_db)):
@@ -203,20 +206,16 @@ async def disburse_funds(request: DisburseRequest, db: Session = Depends(get_db)
 @app.post("/api/v1/repay")
 async def repay_loan(request: RepayRequest, db: Session = Depends(get_db)):
     try:
-        farmer = db.query(FarmerDB).filter(FarmerDB.phone_number == request.phone_number).first()
-        if not farmer:
-            raise HTTPException(status_code=404, detail="Farmer not found")
-        
-        # Record Repayment
+        user = db.query(FarmerDB).filter(FarmerDB.phone_number == request.phone_number).first()
+        if not user:
+            raise HTTPException(status_code=404, detail="User not found")
         repayment_ref = f"REPAY_{datetime.now().strftime('%Y%m%d%H%M%S')}"
         new_tx = TransactionDB(mpesa_receipt=repayment_ref, farmer_phone=request.phone_number, till_number="OLETAI_BANK", amount_kes=request.amount, facility_fee=0)
         db.add(new_tx)
-
-        # Boost Trust Score (Rewards positive behavior)
-        farmer.trust_score = min(farmer.trust_score + 5.0, 100.0)
+        user.trust_score = min(user.trust_score + 5.0, 100.0)
         db.commit()
-
-        return {"status": "success", "message": f"Repayment of KES {request.amount} confirmed.", "new_score": farmer.trust_score}
+        return {"status": "success", "new_score": user.trust_score}
     except Exception as e:
         db.rollback()
         raise HTTPException(status_code=500, detail=str(e))
+    
