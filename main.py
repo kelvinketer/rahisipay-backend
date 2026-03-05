@@ -13,7 +13,7 @@ from sqlalchemy import create_engine, Column, Integer, String, Float, ForeignKey
 from sqlalchemy.orm import sessionmaker, Session, declarative_base
 
 # Initialize the Oletai Agri Finance Core API
-app = FastAPI(title="Oletai Agri Finance Bank Core API", version="5.0")
+app = FastAPI(title="Oletai Agri Finance Bank Core API", version="6.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -110,7 +110,6 @@ class LoanRequest(BaseModel):
     farm_size_acres: float
     repayment_history_multiplier: float = 1.0
     
-    # --- NEW: GLOBAL SCALABILITY FIELDS (With defaults for backward compatibility) ---
     country_code: str = "KE"
     preferred_language: str = "en"
     base_currency: str = "KES"
@@ -155,7 +154,6 @@ async def send_otp(request: SendOTPRequest, db: Session = Depends(get_db)):
     try:
         code = str(random.randint(1000, 9999))
         expiry = datetime.utcnow() + timedelta(minutes=10)
-        
         new_otp = OTPStoreDB(phone_number=request.phone_number, otp_code=code, expires_at=expiry)
         db.add(new_otp)
         db.commit()
@@ -180,7 +178,6 @@ async def verify_otp(request: VerifyOTPRequest, db: Session = Depends(get_db)):
         raise HTTPException(status_code=400, detail="Invalid or expired OTP code")
     
     farmer = db.query(FarmerDB).filter(FarmerDB.phone_number == request.phone_number).first()
-    
     db.delete(valid_otp)
     db.commit()
     
@@ -188,6 +185,28 @@ async def verify_otp(request: VerifyOTPRequest, db: Session = Depends(get_db)):
         return {"status": "success", "is_new_user": False, "score": farmer.trust_score, "limit": farmer.approved_limit}
     else:
         return {"status": "success", "is_new_user": True}
+
+# ==========================================
+# NEW: LIVE TRANSACTION HISTORY ENDPOINT
+# ==========================================
+@app.get("/api/v1/transactions/{phone_number}")
+async def get_transaction_history(phone_number: str, db: Session = Depends(get_db)):
+    try:
+        history = db.query(TransactionDB).filter(
+            TransactionDB.farmer_phone == phone_number
+        ).order_by(TransactionDB.timestamp.desc()).all()
+        
+        return [
+            {
+                "id": tx.id,
+                "title": f"Agrovet Payment (Till {tx.till_number})",
+                "date": tx.timestamp.strftime("%b %d, %I:%M %p"),
+                "amount": f"- KES {tx.amount_kes}",
+                "is_credit": False
+            } for tx in history
+        ]
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 # ==========================================
 # FINTECH ENDPOINTS
@@ -205,7 +224,6 @@ async def apply_for_loan(request: LoanRequest, db: Session = Depends(get_db)):
                 farm_size_acres=request.farm_size_acres, 
                 trust_score=decision["score"], 
                 approved_limit=decision["amount"],
-                # Mapping the new global fields
                 country_code=request.country_code,
                 preferred_language=request.preferred_language,
                 base_currency=request.base_currency,
@@ -230,7 +248,13 @@ async def disburse_funds(request: DisburseRequest, db: Session = Depends(get_db)
         receipt_code = trigger_mpesa_b2b(request.amount_kes, request.till_number, request.phone_number)
         fee = int(request.amount_kes * 0.08)
         
-        new_transaction = TransactionDB(mpesa_receipt=receipt_code, farmer_phone=request.phone_number, till_number=request.till_number, amount_kes=request.amount_kes, facility_fee=fee)
+        new_transaction = TransactionDB(
+            mpesa_receipt=receipt_code, 
+            farmer_phone=request.phone_number, 
+            till_number=request.till_number, 
+            amount_kes=request.amount_kes, 
+            facility_fee=fee
+        )
         db.add(new_transaction)
         db.commit()
         
@@ -238,4 +262,3 @@ async def disburse_funds(request: DisburseRequest, db: Session = Depends(get_db)
     except Exception as e:
         db.rollback()
         raise HTTPException(status_code=500, detail=str(e))
-    
