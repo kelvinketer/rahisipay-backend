@@ -14,7 +14,7 @@ from sqlalchemy.orm import sessionmaker, Session, declarative_base
 from sqlalchemy.exc import IntegrityError
 
 # Initialize the Oletai Agri Finance Core API
-app = FastAPI(title="Oletai Agri Finance Bank Core API", version="8.0")
+app = FastAPI(title="Oletai Agri Finance Bank Core API", version="9.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -63,6 +63,7 @@ class TransactionDB(Base):
     mpesa_receipt = Column(String, unique=True, index=True)
     farmer_phone = Column(String)
     till_number = Column(String)
+    agent_phone = Column(String, nullable=True) # --- ADDED: Tracks which agent made the sale
     amount_kes = Column(Integer)
     facility_fee = Column(Integer)
     timestamp = Column(DateTime, default=datetime.utcnow)
@@ -74,7 +75,6 @@ class OTPStoreDB(Base):
     otp_code = Column(String)
     expires_at = Column(DateTime)
 
-# --- NEW AGROVET DATABASE TABLE ---
 class AgrovetDB(Base):
     __tablename__ = "agrovets"
     id = Column(Integer, primary_key=True, index=True)
@@ -83,6 +83,17 @@ class AgrovetDB(Base):
     owner_phone = Column(String)
     location = Column(String)
     is_active = Column(Boolean, default=True) # Allows you to suspend agrovets
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+# --- NEW: AGENT DATABASE TABLE ---
+class AgentDB(Base):
+    __tablename__ = "agents"
+    id = Column(Integer, primary_key=True, index=True)
+    agent_name = Column(String)
+    phone_number = Column(String, unique=True, index=True)
+    commission_balance = Column(Integer, default=0) # Total earned but not yet withdrawn
+    total_sales_count = Column(Integer, default=0)
+    is_active = Column(Boolean, default=True)
     created_at = Column(DateTime, default=datetime.utcnow)
 
 Base.metadata.create_all(bind=engine)
@@ -120,12 +131,22 @@ class RepayRequest(BaseModel):
     phone_number: str
     amount: int
 
-# --- NEW AGROVET REQUEST MODEL ---
 class AgrovetRegisterRequest(BaseModel):
     business_name: str
     till_number: str
     owner_phone: str
     location: str
+
+# --- NEW: AGENT REQUEST MODELS ---
+class AgentRegisterRequest(BaseModel):
+    agent_name: str
+    phone_number: str
+
+class AgentSaleRequest(BaseModel):
+    agent_phone: str
+    farmer_phone: str
+    amount_kes: int
+    product_name: str # e.g. "Agrico Markies Seeds - 50kg"
 
 # ==========================================
 # MULTI-SEGMENT SCORING ALGORITHM
@@ -148,7 +169,7 @@ def calculate_multi_segment_score(segment: str, identifier: str, units: float):
         else: return {"tier": "Tier 3: Harvest", "amount": 50000, "fee": 4000, "score": trust_score}
 
 # ==========================================
-# ENDPOINTS
+# CORE ENDPOINTS
 # ==========================================
 
 @app.post("/api/v1/auth/send-otp")
@@ -238,10 +259,6 @@ async def repay_loan(request: RepayRequest, db: Session = Depends(get_db)):
         db.rollback()
         raise HTTPException(status_code=500, detail=str(e))
 
-# ==========================================
-# NEW AGROVET ENDPOINTS
-# ==========================================
-
 @app.post("/api/v1/agrovets/register")
 async def register_agrovet(request: AgrovetRegisterRequest, db: Session = Depends(get_db)):
     try:
@@ -257,7 +274,6 @@ async def register_agrovet(request: AgrovetRegisterRequest, db: Session = Depend
         return {"status": "success", "message": "Agrovet registered successfully"}
     except IntegrityError:
         db.rollback()
-        # This catches if an agrovet tries to register the same till number twice
         raise HTTPException(status_code=400, detail="This Till Number is already registered.")
     except Exception as e:
         db.rollback()
@@ -266,10 +282,7 @@ async def register_agrovet(request: AgrovetRegisterRequest, db: Session = Depend
 @app.get("/api/v1/agrovets")
 async def get_active_agrovets(db: Session = Depends(get_db)):
     try:
-        # Fetch only active agrovets, ordered by newest first
         agrovets = db.query(AgrovetDB).filter(AgrovetDB.is_active == True).order_by(AgrovetDB.created_at.desc()).all()
-        
-        # Format the response exactly how the Flutter Autocomplete widget expects it
         return [
             {
                 "name": agrovet.business_name,
@@ -279,3 +292,79 @@ async def get_active_agrovets(db: Session = Depends(get_db)):
         ]
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+# ==========================================
+# NEW: AGRI-CO AGENT ENDPOINTS
+# ==========================================
+
+@app.post("/api/v1/agents/register")
+async def register_agent(request: AgentRegisterRequest, db: Session = Depends(get_db)):
+    try:
+        new_agent = AgentDB(agent_name=request.agent_name, phone_number=request.phone_number)
+        db.add(new_agent)
+        db.commit()
+        return {"status": "success", "message": "Agent registered successfully"}
+    except IntegrityError:
+        db.rollback()
+        raise HTTPException(status_code=400, detail="Agent phone number is already registered.")
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/api/v1/agent/log-sale")
+async def log_agent_sale(request: AgentSaleRequest, db: Session = Depends(get_db)):
+    try:
+        # 1. Verify Agent
+        agent = db.query(AgentDB).filter(AgentDB.phone_number == request.agent_phone, AgentDB.is_active == True).first()
+        if not agent:
+            raise HTTPException(status_code=404, detail="Active Agent not found")
+
+        # 2. Verify Farmer has enough balance (simplified for now, assumes approved_limit covers it)
+        farmer = db.query(FarmerDB).filter(FarmerDB.phone_number == request.farmer_phone).first()
+        if not farmer:
+            raise HTTPException(status_code=404, detail="Farmer not registered on RahisiPay")
+
+        # 3. Calculate Commission (5% for Agrico seeds)
+        commission = int(request.amount_kes * 0.05)
+
+        # 4. Log the Transaction
+        receipt_code = f"AGRICO_{datetime.now().strftime('%Y%m%d%H%M%S')}"
+        new_tx = TransactionDB(
+            mpesa_receipt=receipt_code,
+            farmer_phone=request.farmer_phone,
+            till_number="AGRICO_HUB", # Central hub for seed distribution
+            agent_phone=request.agent_phone,
+            amount_kes=request.amount_kes,
+            facility_fee=0 # Waived for high-quality seed purchases
+        )
+        
+        # 5. Update Agent Metrics
+        agent.commission_balance += commission
+        agent.total_sales_count += 1
+
+        db.add(new_tx)
+        db.commit()
+
+        # 6. Send confirmation SMS to Farmer
+        sms.send(f"Confirmed: You have purchased {request.product_name} via Agent {agent.agent_name}. KES {request.amount_kes} has been utilized from your Oletai limit.", [request.farmer_phone])
+
+        return {
+            "status": "success", 
+            "receipt": receipt_code, 
+            "commission_earned": commission,
+            "new_balance": agent.commission_balance
+        }
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/v1/agent/stats/{phone_number}")
+async def get_agent_stats(phone_number: str, db: Session = Depends(get_db)):
+    agent = db.query(AgentDB).filter(AgentDB.phone_number == phone_number).first()
+    if not agent:
+        raise HTTPException(status_code=404, detail="Agent not found")
+    return {
+        "name": agent.agent_name,
+        "balance": agent.commission_balance,
+        "sales": agent.total_sales_count
+    }
