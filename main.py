@@ -100,13 +100,19 @@ class AgentDB(Base):
 # 1. Create all new tables (like 'agents')
 Base.metadata.create_all(bind=engine)
 
-# 2. SELF-HEALING MIGRATION: Force 'agent_phone' into 'transactions' if missing
+# 2. SELF-HEALING MIGRATION: Force missing columns into existing tables
 try:
     with engine.connect() as conn:
+        # Fix the transactions table
         conn.execute(text("ALTER TABLE transactions ADD COLUMN IF NOT EXISTS agent_phone VARCHAR"))
+        
+        # Fix the agents table (Upgrade schema)
+        conn.execute(text("ALTER TABLE agents ADD COLUMN IF NOT EXISTS commission_balance INTEGER DEFAULT 0"))
+        conn.execute(text("ALTER TABLE agents ADD COLUMN IF NOT EXISTS total_sales_count INTEGER DEFAULT 0"))
+        
         conn.commit()
 except Exception as e:
-    print(f"Migration Notice (Safe to ignore if column exists): {e}")
+    print(f"Migration Notice: {e}")
 
 def get_db():
     db = SessionLocal()
