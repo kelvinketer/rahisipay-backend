@@ -9,12 +9,13 @@ import africastalking
 from datetime import datetime, timedelta
 
 # --- SQLALCHEMY DATABASE IMPORTS ---
-from sqlalchemy import create_engine, Column, Integer, String, Float, ForeignKey, DateTime, Boolean
+# Notice we added 'text' here for raw SQL execution
+from sqlalchemy import create_engine, Column, Integer, String, Float, ForeignKey, DateTime, Boolean, text
 from sqlalchemy.orm import sessionmaker, Session, declarative_base
 from sqlalchemy.exc import IntegrityError
 
 # Initialize the Oletai Agri Finance Core API
-app = FastAPI(title="Oletai Agri Finance Bank Core API", version="9.0")
+app = FastAPI(title="Oletai Agri Finance Bank Core API", version="10.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -48,8 +49,8 @@ class FarmerDB(Base):
     __tablename__ = "farmers"
     id = Column(Integer, primary_key=True, index=True)
     phone_number = Column(String, unique=True, index=True)
-    user_segment = Column(String) # Replaces/Overloads crop_type
-    identifier = Column(String)    # Crop Type, Student ID, or Job Title
+    user_segment = Column(String) 
+    identifier = Column(String)    
     farm_size_acres = Column(Float, default=0.0)
     trust_score = Column(Float)
     approved_limit = Column(Integer)
@@ -82,7 +83,7 @@ class AgrovetDB(Base):
     till_number = Column(String, unique=True, index=True)
     owner_phone = Column(String)
     location = Column(String)
-    is_active = Column(Boolean, default=True) # Allows you to suspend agrovets
+    is_active = Column(Boolean, default=True) 
     created_at = Column(DateTime, default=datetime.utcnow)
 
 # --- NEW: AGENT DATABASE TABLE ---
@@ -91,12 +92,21 @@ class AgentDB(Base):
     id = Column(Integer, primary_key=True, index=True)
     agent_name = Column(String)
     phone_number = Column(String, unique=True, index=True)
-    commission_balance = Column(Integer, default=0) # Total earned but not yet withdrawn
+    commission_balance = Column(Integer, default=0) 
     total_sales_count = Column(Integer, default=0)
     is_active = Column(Boolean, default=True)
     created_at = Column(DateTime, default=datetime.utcnow)
 
+# 1. Create all new tables (like 'agents')
 Base.metadata.create_all(bind=engine)
+
+# 2. SELF-HEALING MIGRATION: Force 'agent_phone' into 'transactions' if missing
+try:
+    with engine.connect() as conn:
+        conn.execute(text("ALTER TABLE transactions ADD COLUMN IF NOT EXISTS agent_phone VARCHAR"))
+        conn.commit()
+except Exception as e:
+    print(f"Migration Notice (Safe to ignore if column exists): {e}")
 
 def get_db():
     db = SessionLocal()
@@ -137,7 +147,6 @@ class AgrovetRegisterRequest(BaseModel):
     owner_phone: str
     location: str
 
-# --- NEW: AGENT REQUEST MODELS ---
 class AgentRegisterRequest(BaseModel):
     agent_name: str
     phone_number: str
@@ -146,18 +155,17 @@ class AgentSaleRequest(BaseModel):
     agent_phone: str
     farmer_phone: str
     amount_kes: int
-    product_name: str # e.g. "Agrico Markies Seeds - 50kg"
+    product_name: str 
 
 # ==========================================
 # MULTI-SEGMENT SCORING ALGORITHM
 # ==========================================
 def calculate_multi_segment_score(segment: str, identifier: str, units: float):
-    # Tiered Entry Points
     if segment == "Student":
         return {"tier": "Elimu Starter", "amount": 5000, "fee": 400, "score": 45.0}
     elif segment == "Professional":
         return {"tier": "Urban Maisha", "amount": 25000, "fee": 2000, "score": 65.0}
-    else: # Default: Farmer
+    else: 
         crop_scores = {"avocado": 10, "coffee": 8, "maize": 4}
         c_score = crop_scores.get(identifier.lower(), 3)
         f_score = 10 if units >= 5.0 else 7 if units >= 2.0 else 5
@@ -294,7 +302,7 @@ async def get_active_agrovets(db: Session = Depends(get_db)):
         raise HTTPException(status_code=500, detail=str(e))
 
 # ==========================================
-# NEW: AGRI-CO AGENT ENDPOINTS
+# AGRI-CO AGENT ENDPOINTS
 # ==========================================
 
 @app.post("/api/v1/agents/register")
@@ -309,44 +317,39 @@ async def register_agent(request: AgentRegisterRequest, db: Session = Depends(ge
         raise HTTPException(status_code=400, detail="Agent phone number is already registered.")
     except Exception as e:
         db.rollback()
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=f"DB Error: {str(e)}")
 
 @app.post("/api/v1/agent/log-sale")
 async def log_agent_sale(request: AgentSaleRequest, db: Session = Depends(get_db)):
     try:
-        # 1. Verify Agent
         agent = db.query(AgentDB).filter(AgentDB.phone_number == request.agent_phone, AgentDB.is_active == True).first()
         if not agent:
             raise HTTPException(status_code=404, detail="Active Agent not found")
 
-        # 2. Verify Farmer has enough balance (simplified for now, assumes approved_limit covers it)
         farmer = db.query(FarmerDB).filter(FarmerDB.phone_number == request.farmer_phone).first()
         if not farmer:
             raise HTTPException(status_code=404, detail="Farmer not registered on RahisiPay")
 
-        # 3. Calculate Commission (5% for Agrico seeds)
         commission = int(request.amount_kes * 0.05)
-
-        # 4. Log the Transaction
         receipt_code = f"AGRICO_{datetime.now().strftime('%Y%m%d%H%M%S')}"
+        
         new_tx = TransactionDB(
             mpesa_receipt=receipt_code,
             farmer_phone=request.farmer_phone,
-            till_number="AGRICO_HUB", # Central hub for seed distribution
+            till_number="AGRICO_HUB",
             agent_phone=request.agent_phone,
             amount_kes=request.amount_kes,
-            facility_fee=0 # Waived for high-quality seed purchases
+            facility_fee=0 
         )
         
-        # 5. Update Agent Metrics
         agent.commission_balance += commission
         agent.total_sales_count += 1
 
         db.add(new_tx)
         db.commit()
 
-        # 6. Send confirmation SMS to Farmer
-        sms.send(f"Confirmed: You have purchased {request.product_name} via Agent {agent.agent_name}. KES {request.amount_kes} has been utilized from your Oletai limit.", [request.farmer_phone])
+        # Send confirmation SMS
+        sms.send(f"Confirmed: You have purchased {request.product_name} via Agent {agent.agent_name}. KES {request.amount_kes} utilized.", [request.farmer_phone])
 
         return {
             "status": "success", 
@@ -354,17 +357,25 @@ async def log_agent_sale(request: AgentSaleRequest, db: Session = Depends(get_db
             "commission_earned": commission,
             "new_balance": agent.commission_balance
         }
+    except HTTPException as he:
+        raise he
     except Exception as e:
         db.rollback()
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=f"Log Sale Error: {str(e)}")
 
 @app.get("/api/v1/agent/stats/{phone_number}")
 async def get_agent_stats(phone_number: str, db: Session = Depends(get_db)):
-    agent = db.query(AgentDB).filter(AgentDB.phone_number == phone_number).first()
-    if not agent:
-        raise HTTPException(status_code=404, detail="Agent not found")
-    return {
-        "name": agent.agent_name,
-        "balance": agent.commission_balance,
-        "sales": agent.total_sales_count
-    }
+    try:
+        agent = db.query(AgentDB).filter(AgentDB.phone_number == phone_number).first()
+        if not agent:
+            raise HTTPException(status_code=404, detail="Agent not found")
+        return {
+            "name": agent.agent_name,
+            "balance": agent.commission_balance,
+            "sales": agent.total_sales_count
+        }
+    except HTTPException as he:
+        raise he  # Passes the 404 naturally
+    except Exception as e:
+        # Catches exact database mapping errors
+        raise HTTPException(status_code=500, detail=f"Stats Error: {str(e)}")
