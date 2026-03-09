@@ -9,7 +9,6 @@ import africastalking
 from datetime import datetime, timedelta
 
 # --- SQLALCHEMY DATABASE IMPORTS ---
-# Notice we added 'text' here for raw SQL execution
 from sqlalchemy import create_engine, Column, Integer, String, Float, ForeignKey, DateTime, Boolean, text
 from sqlalchemy.orm import sessionmaker, Session, declarative_base
 from sqlalchemy.exc import IntegrityError
@@ -30,6 +29,9 @@ app.add_middleware(
 # ==========================================
 AT_USERNAME = os.getenv("AT_USERNAME", "sandbox")
 AT_API_KEY = os.getenv("AT_API_KEY", "your_api_key")
+
+# Print to Render logs on startup so we know exactly which environment we are in
+print(f"🚀 STARTING AFRICA'S TALKING WITH USERNAME: {AT_USERNAME}")
 
 africastalking.initialize(username=AT_USERNAME, api_key=AT_API_KEY)
 sms = africastalking.SMS
@@ -64,7 +66,7 @@ class TransactionDB(Base):
     mpesa_receipt = Column(String, unique=True, index=True)
     farmer_phone = Column(String)
     till_number = Column(String)
-    agent_phone = Column(String, nullable=True) # --- ADDED: Tracks which agent made the sale
+    agent_phone = Column(String, nullable=True)
     amount_kes = Column(Integer)
     facility_fee = Column(Integer)
     timestamp = Column(DateTime, default=datetime.utcnow)
@@ -86,7 +88,6 @@ class AgrovetDB(Base):
     is_active = Column(Boolean, default=True) 
     created_at = Column(DateTime, default=datetime.utcnow)
 
-# --- NEW: AGENT DATABASE TABLE ---
 class AgentDB(Base):
     __tablename__ = "agents"
     id = Column(Integer, primary_key=True, index=True)
@@ -97,21 +98,15 @@ class AgentDB(Base):
     is_active = Column(Boolean, default=True)
     created_at = Column(DateTime, default=datetime.utcnow)
 
-# 1. Create all new tables (like 'agents')
 Base.metadata.create_all(bind=engine)
 
-# 2. SELF-HEALING MIGRATION: Force missing columns into existing tables
 try:
     with engine.connect() as conn:
-        # Fix the transactions table
         conn.execute(text("ALTER TABLE transactions ADD COLUMN IF NOT EXISTS agent_phone VARCHAR"))
-        
-        # Fix the agents table completely
         conn.execute(text("ALTER TABLE agents ADD COLUMN IF NOT EXISTS commission_balance INTEGER DEFAULT 0"))
         conn.execute(text("ALTER TABLE agents ADD COLUMN IF NOT EXISTS total_sales_count INTEGER DEFAULT 0"))
         conn.execute(text("ALTER TABLE agents ADD COLUMN IF NOT EXISTS is_active BOOLEAN DEFAULT TRUE"))
         conn.execute(text("ALTER TABLE agents ADD COLUMN IF NOT EXISTS created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP"))
-        
         conn.commit()
 except Exception as e:
     print(f"Migration Notice: {e}")
@@ -165,9 +160,6 @@ class AgentSaleRequest(BaseModel):
     amount_kes: int
     product_name: str 
 
-# ==========================================
-# MULTI-SEGMENT SCORING ALGORITHM
-# ==========================================
 def calculate_multi_segment_score(segment: str, identifier: str, units: float):
     if segment == "Student":
         return {"tier": "Elimu Starter", "amount": 5000, "fee": 400, "score": 45.0}
@@ -196,10 +188,21 @@ async def send_otp(request: SendOTPRequest, db: Session = Depends(get_db)):
         new_otp = OTPStoreDB(phone_number=request.phone_number, otp_code=code, expires_at=expiry)
         db.add(new_otp)
         db.commit()
-        sms.send(f"Welcome to Oletai Bank! Your PIN: {code}", [request.phone_number])
-        return {"status": "success", "message": "OTP sent"}
+        
+        print(f"--- 📡 INITIATING SMS TO {request.phone_number} ---")
+        
+        # 1. Capture the exact response from Africa's Talking
+        at_response = sms.send(f"Welcome to Oletai Bank! Your PIN: {code}", [request.phone_number])
+        
+        # 2. Print it aggressively to Render logs
+        print(f"🔥 AFRICA'S TALKING RAW RESPONSE: {at_response}")
+        
+        return {"status": "success", "message": "OTP processing", "at_debug": at_response}
+        
     except Exception as e:
         db.rollback()
+        # Print Python-level crashes (like wrong API keys)
+        print(f"❌ CRASH IN SMS MODULE: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/api/v1/auth/verify-otp")
@@ -309,10 +312,6 @@ async def get_active_agrovets(db: Session = Depends(get_db)):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-# ==========================================
-# AGRI-CO AGENT ENDPOINTS
-# ==========================================
-
 @app.post("/api/v1/agents/register")
 async def register_agent(request: AgentRegisterRequest, db: Session = Depends(get_db)):
     try:
@@ -356,8 +355,9 @@ async def log_agent_sale(request: AgentSaleRequest, db: Session = Depends(get_db
         db.add(new_tx)
         db.commit()
 
-        # Send confirmation SMS
-        sms.send(f"Confirmed: You have purchased {request.product_name} via Agent {agent.agent_name}. KES {request.amount_kes} utilized.", [request.farmer_phone])
+        print(f"--- 📡 INITIATING CONFIRMATION SMS TO {request.farmer_phone} ---")
+        at_response = sms.send(f"Confirmed: You have purchased {request.product_name} via Agent {agent.agent_name}. KES {request.amount_kes} utilized.", [request.farmer_phone])
+        print(f"🔥 AFRICA'S TALKING RAW RESPONSE: {at_response}")
 
         return {
             "status": "success", 
@@ -369,6 +369,7 @@ async def log_agent_sale(request: AgentSaleRequest, db: Session = Depends(get_db
         raise he
     except Exception as e:
         db.rollback()
+        print(f"❌ CRASH IN LOG SALE MODULE: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Log Sale Error: {str(e)}")
 
 @app.get("/api/v1/agent/stats/{phone_number}")
@@ -383,7 +384,8 @@ async def get_agent_stats(phone_number: str, db: Session = Depends(get_db)):
             "sales": agent.total_sales_count
         }
     except HTTPException as he:
-        raise he  # Passes the 404 naturally
+        raise he 
     except Exception as e:
-        # Catches exact database mapping errors
         raise HTTPException(status_code=500, detail=f"Stats Error: {str(e)}")
+    
+    # DevOps Debugging: Forcing AT Logs Push why is this not working again can it work now 
