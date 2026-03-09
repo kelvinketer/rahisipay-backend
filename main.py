@@ -9,8 +9,9 @@ import africastalking
 from datetime import datetime, timedelta
 
 # --- SQLALCHEMY DATABASE IMPORTS ---
-from sqlalchemy import create_engine, Column, Integer, String, Float, ForeignKey, DateTime
+from sqlalchemy import create_engine, Column, Integer, String, Float, ForeignKey, DateTime, Boolean
 from sqlalchemy.orm import sessionmaker, Session, declarative_base
+from sqlalchemy.exc import IntegrityError
 
 # Initialize the Oletai Agri Finance Core API
 app = FastAPI(title="Oletai Agri Finance Bank Core API", version="8.0")
@@ -73,6 +74,17 @@ class OTPStoreDB(Base):
     otp_code = Column(String)
     expires_at = Column(DateTime)
 
+# --- NEW AGROVET DATABASE TABLE ---
+class AgrovetDB(Base):
+    __tablename__ = "agrovets"
+    id = Column(Integer, primary_key=True, index=True)
+    business_name = Column(String, index=True)
+    till_number = Column(String, unique=True, index=True)
+    owner_phone = Column(String)
+    location = Column(String)
+    is_active = Column(Boolean, default=True) # Allows you to suspend agrovets
+    created_at = Column(DateTime, default=datetime.utcnow)
+
 Base.metadata.create_all(bind=engine)
 
 def get_db():
@@ -94,8 +106,8 @@ class VerifyOTPRequest(BaseModel):
 
 class LoanRequest(BaseModel):
     phone_number: str
-    user_segment: str = "Farmer" # "Farmer", "Student", or "Professional"
-    identifier: str              # e.g., "Avocado", "JKUAT-ID-123", "Software Engineer"
+    user_segment: str = "Farmer" 
+    identifier: str              
     farm_size_acres: float = 0.0
     repayment_history_multiplier: float = 1.0
 
@@ -107,6 +119,13 @@ class DisburseRequest(BaseModel):
 class RepayRequest(BaseModel):
     phone_number: str
     amount: int
+
+# --- NEW AGROVET REQUEST MODEL ---
+class AgrovetRegisterRequest(BaseModel):
+    business_name: str
+    till_number: str
+    owner_phone: str
+    location: str
 
 # ==========================================
 # MULTI-SEGMENT SCORING ALGORITHM
@@ -218,4 +237,45 @@ async def repay_loan(request: RepayRequest, db: Session = Depends(get_db)):
     except Exception as e:
         db.rollback()
         raise HTTPException(status_code=500, detail=str(e))
-    
+
+# ==========================================
+# NEW AGROVET ENDPOINTS
+# ==========================================
+
+@app.post("/api/v1/agrovets/register")
+async def register_agrovet(request: AgrovetRegisterRequest, db: Session = Depends(get_db)):
+    try:
+        new_agrovet = AgrovetDB(
+            business_name=request.business_name,
+            till_number=request.till_number,
+            owner_phone=request.owner_phone,
+            location=request.location
+        )
+        db.add(new_agrovet)
+        db.commit()
+        db.refresh(new_agrovet)
+        return {"status": "success", "message": "Agrovet registered successfully"}
+    except IntegrityError:
+        db.rollback()
+        # This catches if an agrovet tries to register the same till number twice
+        raise HTTPException(status_code=400, detail="This Till Number is already registered.")
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/v1/agrovets")
+async def get_active_agrovets(db: Session = Depends(get_db)):
+    try:
+        # Fetch only active agrovets, ordered by newest first
+        agrovets = db.query(AgrovetDB).filter(AgrovetDB.is_active == True).order_by(AgrovetDB.created_at.desc()).all()
+        
+        # Format the response exactly how the Flutter Autocomplete widget expects it
+        return [
+            {
+                "name": agrovet.business_name,
+                "till_number": agrovet.till_number,
+                "location": agrovet.location
+            } for agrovet in agrovets
+        ]
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
