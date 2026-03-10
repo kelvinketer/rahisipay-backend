@@ -1,9 +1,10 @@
+import os
+import google.generativeai as genai
 from fastapi import FastAPI, HTTPException, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import Optional, List
 import requests
-import os
 import random 
 import africastalking 
 from datetime import datetime, timedelta
@@ -30,7 +31,6 @@ app.add_middleware(
 AT_USERNAME = os.getenv("AT_USERNAME", "sandbox")
 AT_API_KEY = os.getenv("AT_API_KEY", "your_api_key")
 
-# Print to Render logs on startup so we know exactly which environment we are in
 print(f"🚀 STARTING AFRICA'S TALKING WITH USERNAME: {AT_USERNAME}")
 
 africastalking.initialize(username=AT_USERNAME, api_key=AT_API_KEY)
@@ -160,6 +160,11 @@ class AgentSaleRequest(BaseModel):
     amount_kes: int
     product_name: str 
 
+# --- NEW: AI CHAT DATA MODEL ---
+class ChatRequest(BaseModel):
+    farmer_phone: str
+    message: str
+
 def calculate_multi_segment_score(segment: str, identifier: str, units: float):
     if segment == "Student":
         return {"tier": "Elimu Starter", "amount": 5000, "fee": 400, "score": 45.0}
@@ -190,18 +195,13 @@ async def send_otp(request: SendOTPRequest, db: Session = Depends(get_db)):
         db.commit()
         
         print(f"--- 📡 INITIATING SMS TO {request.phone_number} ---")
-        
-        # 1. Capture the exact response from Africa's Talking
         at_response = sms.send(f"Welcome to Oletai Bank! Your PIN: {code}", [request.phone_number])
-        
-        # 2. Print it aggressively to Render logs
         print(f"🔥 AFRICA'S TALKING RAW RESPONSE: {at_response}")
         
         return {"status": "success", "message": "OTP processing", "at_debug": at_response}
         
     except Exception as e:
         db.rollback()
-        # Print Python-level crashes (like wrong API keys)
         print(f"❌ CRASH IN SMS MODULE: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -388,4 +388,37 @@ async def get_agent_stats(phone_number: str, db: Session = Depends(get_db)):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Stats Error: {str(e)}")
     
-    # DevOps Debugging: Forcing AT Logs Push why is this not working again can it work now 
+# ==========================================
+# OLETAI AI FARM ADVISOR (POWERED BY GEMINI)
+# ==========================================
+
+# Configure Gemini (Ensure you add GEMINI_API_KEY to your Render Environment Variables!)
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "YOUR_FALLBACK_KEY_HERE_FOR_LOCAL_TESTING")
+genai.configure(api_key=GEMINI_API_KEY)
+
+# Define the personality and rules for the AI
+oletai_system_instruction = """
+You are the 'Oletai Farm Advisor', an expert agronomist operating in Kenya, specifically trained on data for Kiambu County (Juja area). 
+Your tone is professional, encouraging, and deeply knowledgeable about local farming practices, soil types (like red volcanic soil), and weather patterns. 
+Always refer to capital as an 'investment' or 'leverage', NEVER as a 'loan' or 'debt'. 
+Keep your answers concise, practical, and highly actionable for smallholder farmers. If you recommend farm inputs, mention they can buy them from verified Oletai Agrovet partners.
+"""
+
+# We use gemini-1.5-flash because it is blazingly fast and highly cost-effective
+ai_model = genai.GenerativeModel(
+    model_name="gemini-1.5-flash",
+    system_instruction=oletai_system_instruction
+)
+
+@app.post("/api/v1/advisor/chat", tags=["AI Advisor"])
+async def chat_with_advisor(req: ChatRequest):
+    try:
+        # Generate the response using Gemini
+        response = ai_model.generate_content(req.message)
+        
+        return {
+            "status": "success",
+            "reply": response.text
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"AI Engine Error: {str(e)}")
