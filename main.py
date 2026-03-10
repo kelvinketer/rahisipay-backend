@@ -151,6 +151,14 @@ class AgrovetRegisterRequest(BaseModel):
     owner_phone: str
     location: str
 
+# --- NEW: AGROVET AUTH MODELS ---
+class AgrovetLoginRequest(BaseModel):
+    till_number: str
+
+class AgrovetVerifyRequest(BaseModel):
+    till_number: str
+    otp_code: str
+
 class AgentRegisterRequest(BaseModel):
     agent_name: str
     phone_number: str
@@ -311,6 +319,52 @@ async def get_active_agrovets(db: Session = Depends(get_db)):
         ]
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+# --- NEW: AGROVET AUTHENTICATION ---
+@app.post("/api/v1/agrovets/login/send-otp", tags=["Agrovet Auth"])
+async def agrovet_send_otp(request: AgrovetLoginRequest, db: Session = Depends(get_db)):
+    agrovet = db.query(AgrovetDB).filter(AgrovetDB.till_number == request.till_number).first()
+    if not agrovet:
+        raise HTTPException(status_code=404, detail="Till Number not found. Please register first.")
+    
+    code = str(random.randint(1000, 9999))
+    expiry = datetime.utcnow() + timedelta(minutes=10)
+    
+    new_otp = OTPStoreDB(phone_number=agrovet.owner_phone, otp_code=code, expires_at=expiry)
+    db.add(new_otp)
+    db.commit()
+    
+    print(f"--- 📡 INITIATING AGROVET SMS TO {agrovet.owner_phone} ---")
+    at_response = sms.send(f"Oletai Merchant Portal PIN: {code}", [agrovet.owner_phone])
+    print(f"🔥 AFRICA'S TALKING RAW RESPONSE: {at_response}")
+    
+    masked_phone = f"{agrovet.owner_phone[:5]}***{agrovet.owner_phone[-4:]}"
+    return {"status": "success", "masked_phone": masked_phone}
+
+@app.post("/api/v1/agrovets/login/verify-otp", tags=["Agrovet Auth"])
+async def agrovet_verify_otp(request: AgrovetVerifyRequest, db: Session = Depends(get_db)):
+    agrovet = db.query(AgrovetDB).filter(AgrovetDB.till_number == request.till_number).first()
+    if not agrovet:
+        raise HTTPException(status_code=404, detail="Agrovet not found")
+        
+    valid_otp = db.query(OTPStoreDB).filter(
+        OTPStoreDB.phone_number == agrovet.owner_phone, 
+        OTPStoreDB.otp_code == request.otp_code, 
+        OTPStoreDB.expires_at > datetime.utcnow()
+    ).first()
+    
+    if not valid_otp:
+        raise HTTPException(status_code=400, detail="Invalid or expired PIN")
+        
+    db.delete(valid_otp)
+    db.commit()
+    
+    return {
+        "status": "success", 
+        "business_name": agrovet.business_name,
+        "owner_phone": agrovet.owner_phone,
+        "till_number": agrovet.till_number
+    }
 
 @app.post("/api/v1/agents/register")
 async def register_agent(request: AgentRegisterRequest, db: Session = Depends(get_db)):
