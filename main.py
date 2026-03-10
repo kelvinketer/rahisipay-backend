@@ -1,6 +1,7 @@
 import os
 import google.generativeai as genai
-from fastapi import FastAPI, HTTPException, Depends
+# --- ADDED: File, UploadFile, Form for handling image uploads ---
+from fastapi import FastAPI, HTTPException, Depends, File, UploadFile, Form
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import Optional, List
@@ -160,7 +161,6 @@ class AgentSaleRequest(BaseModel):
     amount_kes: int
     product_name: str 
 
-# --- NEW: AI CHAT DATA MODEL ---
 class ChatRequest(BaseModel):
     farmer_phone: str
     message: str
@@ -422,6 +422,39 @@ async def chat_with_advisor(req: ChatRequest):
         response = ai_model.generate_content(req.message)
         return {"status": "success", "reply": response.text}
     except Exception as e:
-        # This will print the ACTUAL error to your Render logs
         print(f"🔥 GEMINI CRASH: {str(e)}")
         raise HTTPException(status_code=500, detail="AI Engine Error")
+
+# --- NEW: MULTIMODAL DIAGNOSIS ENDPOINT ---
+@app.post("/api/v1/advisor/diagnose", tags=["AI Advisor"])
+async def diagnose_crop_issue(
+    farmer_phone: str = Form(...),
+    image: UploadFile = File(...)
+):
+    try:
+        if not GEMINI_API_KEY:
+            return {"status": "error", "diagnosis": "AI service is currently misconfigured."}
+
+        # Read the image bytes from the upload
+        image_bytes = await image.read()
+        
+        # Prepare the Multimodal prompt for Gemini
+        prompt = """
+        Analyze this image of a crop or livestock. 
+        1. Identify the species if possible.
+        2. Detect any visible signs of disease, pests, or malnutrition.
+        3. Provide a clear diagnosis and a step-by-step 'Investment Plan' to fix it.
+        4. Mention if specific inputs (pesticides/fertility) are available at Oletai Agrovets.
+        Keep it professional and localized to Kenya.
+        """
+        
+        # Call Gemini with both the image and the text prompt
+        response = ai_model.generate_content([
+            prompt,
+            {"mime_type": image.content_type, "data": image_bytes}
+        ])
+        
+        return {"status": "success", "diagnosis": response.text}
+    except Exception as e:
+        print(f"🔥 DIAGNOSIS CRASH: {str(e)}")
+        raise HTTPException(status_code=500, detail="AI Diagnostic Error")
