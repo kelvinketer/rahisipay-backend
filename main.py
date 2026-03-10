@@ -392,19 +392,22 @@ async def get_agent_stats(phone_number: str, db: Session = Depends(get_db)):
 # OLETAI AI FARM ADVISOR (POWERED BY GEMINI)
 # ==========================================
 
-# Configure Gemini (Ensure you add GEMINI_API_KEY to your Render Environment Variables!)
-GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "YOUR_FALLBACK_KEY_HERE_FOR_LOCAL_TESTING")
-genai.configure(api_key=GEMINI_API_KEY)
+# Configure Gemini securely
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
-# Define the personality and rules for the AI
+if not GEMINI_API_KEY:
+    print("❌ ERROR: GEMINI_API_KEY is missing from Render Environment Variables!")
+else:
+    print("✅ GEMINI_API_KEY detected. Initializing AI Engine...")
+    genai.configure(api_key=GEMINI_API_KEY)
+
+# Define the personality
 oletai_system_instruction = """
-You are the 'Oletai Farm Advisor', an expert agronomist operating in Kenya, specifically trained on data for Kiambu County (Juja area). 
-Your tone is professional, encouraging, and deeply knowledgeable about local farming practices, soil types (like red volcanic soil), and weather patterns. 
-Always refer to capital as an 'investment' or 'leverage', NEVER as a 'loan' or 'debt'. 
-Keep your answers concise, practical, and highly actionable for smallholder farmers. If you recommend farm inputs, mention they can buy them from verified Oletai Agrovet partners.
+You are the 'Oletai Farm Advisor', an expert agronomist operating in Kenya. 
+Your tone is professional and encouraging. Always refer to capital as an 'investment'. 
+Keep answers concise and actionable.
 """
 
-# We use gemini-1.5-flash because it is blazingly fast and highly cost-effective
 ai_model = genai.GenerativeModel(
     model_name="gemini-1.5-flash",
     system_instruction=oletai_system_instruction
@@ -413,12 +416,12 @@ ai_model = genai.GenerativeModel(
 @app.post("/api/v1/advisor/chat", tags=["AI Advisor"])
 async def chat_with_advisor(req: ChatRequest):
     try:
-        # Generate the response using Gemini
+        if not GEMINI_API_KEY:
+            return {"status": "error", "reply": "AI service is currently misconfigured."}
+            
         response = ai_model.generate_content(req.message)
-        
-        return {
-            "status": "success",
-            "reply": response.text
-        }
+        return {"status": "success", "reply": response.text}
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"AI Engine Error: {str(e)}")
+        # This will print the ACTUAL error to your Render logs
+        print(f"🔥 GEMINI CRASH: {str(e)}")
+        raise HTTPException(status_code=500, detail="AI Engine Error")
