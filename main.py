@@ -441,8 +441,8 @@ async def get_agent_stats(phone_number: str, db: Session = Depends(get_db)):
         raise he 
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Stats Error: {str(e)}")
-    
-# ==========================================
+   
+   # ==========================================
 # OLETAI AI FARM ADVISOR (POWERED BY GEMINI)
 # ==========================================
 
@@ -455,31 +455,52 @@ else:
     print("✅ GEMINI_API_KEY detected. Initializing AI Engine...")
     genai.configure(api_key=GEMINI_API_KEY)
 
-# Define the personality
-oletai_system_instruction = """
-You are the 'Oletai Farm Advisor', an expert agronomist operating in Kenya. 
-Your tone is professional and encouraging. Always refer to capital as an 'investment'. 
-Keep answers concise and actionable.
-"""
-
-ai_model = genai.GenerativeModel(
-    model_name="gemini-2.5-flash",
-    system_instruction=oletai_system_instruction
-)
-
 @app.post("/api/v1/advisor/chat", tags=["AI Advisor"])
-async def chat_with_advisor(req: ChatRequest):
+async def chat_with_advisor(req: ChatRequest, db: Session = Depends(get_db)):
     try:
         if not GEMINI_API_KEY:
             return {"status": "error", "reply": "AI service is currently misconfigured."}
             
+        # 1. FETCH LIVE CONTEXT FROM DATABASE
+        # We query the DB using the phone number passed in the ChatRequest
+        farmer = db.query(FarmerDB).filter(FarmerDB.phone_number == req.farmer_phone).first()
+        
+        # Determine current stats (or use defaults if the farmer isn't fully registered yet)
+        trust_score = farmer.trust_score if farmer else "0 (New User)"
+        buying_power = farmer.approved_limit if farmer else "0"
+        
+        # 2. BUILD THE DYNAMIC SYSTEM PROMPT
+        # Note how we use f-strings to inject the live DB data into the AI's brain
+        dynamic_instruction = f"""
+        You are the 'Oletai Farm Advisor', an expert agronomist operating in Kenya. 
+        Your tone is professional and encouraging. Always refer to capital as an 'investment'.
+        
+        CRITICAL ACCOUNT CONTEXT:
+        - The farmer you are talking to has an Agri-Trust Score of: {trust_score}%
+        - They currently have an available Buying Power of: KES {buying_power}
+        
+        RULES:
+        1. If they ask about funding, loans, capital, or how much money they have, DO NOT tell them to visit a website or contact support.
+        2. Instead, explicitly tell them they have KES {buying_power} available right now. Tell them to click the 'Invest' button on their dashboard to use it at a local Agrovet.
+        3. Keep your advice practical, localized to Kenya, and concise.
+        """
+        
+        # 3. INITIALIZE THE MODEL WITH DYNAMIC INSTRUCTIONS
+        # We initialize the model here so every request gets a fresh context card
+        ai_model = genai.GenerativeModel(
+            model_name="gemini-2.5-flash",
+            system_instruction=dynamic_instruction
+        )
+
+        # 4. GENERATE RESPONSE
         response = ai_model.generate_content(req.message)
         return {"status": "success", "reply": response.text}
+        
     except Exception as e:
         print(f"🔥 GEMINI CRASH: {str(e)}")
         raise HTTPException(status_code=500, detail="AI Engine Error")
 
-# --- NEW: MULTIMODAL DIAGNOSIS ENDPOINT ---
+# --- MULTIMODAL DIAGNOSIS ENDPOINT ---
 @app.post("/api/v1/advisor/diagnose", tags=["AI Advisor"])
 async def diagnose_crop_issue(
     farmer_phone: str = Form(...),
@@ -502,8 +523,11 @@ async def diagnose_crop_issue(
         Keep it professional and localized to Kenya.
         """
         
+        # Use a base model without user context for pure image diagnosis
+        vision_model = genai.GenerativeModel(model_name="gemini-2.5-flash")
+        
         # Call Gemini with both the image and the text prompt
-        response = ai_model.generate_content([
+        response = vision_model.generate_content([
             prompt,
             {"mime_type": image.content_type, "data": image_bytes}
         ])
