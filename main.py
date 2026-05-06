@@ -1,6 +1,5 @@
 import os
 import google.generativeai as genai
-# --- ADDED: File, UploadFile, Form for handling image uploads ---
 from fastapi import FastAPI, HTTPException, Depends, File, UploadFile, Form
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -9,6 +8,17 @@ import requests
 import random 
 import africastalking 
 from datetime import datetime, timedelta
+
+# --- CLOUDINARY IMPORT & CONFIG ---
+import cloudinary
+import cloudinary.uploader
+import cloudinary.api
+
+cloudinary.config( 
+    cloud_name = os.getenv("CLOUDINARY_CLOUD_NAME"), 
+    api_key = os.getenv("CLOUDINARY_API_KEY"), 
+    api_secret = os.getenv("CLOUDINARY_API_SECRET") 
+)
 
 # --- SQLALCHEMY DATABASE IMPORTS ---
 from sqlalchemy import create_engine, Column, Integer, String, Float, ForeignKey, DateTime, Boolean, text
@@ -99,6 +109,17 @@ class AgentDB(Base):
     is_active = Column(Boolean, default=True)
     created_at = Column(DateTime, default=datetime.utcnow)
 
+# --- CITIZEN SCIENCE RESEARCH DATABASE ---
+class AIDiagnosisDB(Base):
+    __tablename__ = "ai_diagnoses"
+    id = Column(Integer, primary_key=True, index=True)
+    farmer_phone = Column(String, index=True)
+    image_url = Column(String, nullable=True) 
+    diagnosis_text = Column(String)
+    latitude = Column(Float, nullable=True)
+    longitude = Column(Float, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
 Base.metadata.create_all(bind=engine)
 
 try:
@@ -136,6 +157,13 @@ class LoanRequest(BaseModel):
     farm_size_acres: float = 0.0
     repayment_history_multiplier: float = 1.0
 
+# --- NEW: ACADEMY REWARD MODEL ---
+class AcademyCompletionRequest(BaseModel):
+    phone_number: str
+    course_name: str
+    score_boost: float = 2.0  # +2% trust score
+    limit_boost: int = 5000   # + KES 5,000 buying power
+
 class DisburseRequest(BaseModel):
     phone_number: str
     till_number: str
@@ -151,7 +179,6 @@ class AgrovetRegisterRequest(BaseModel):
     owner_phone: str
     location: str
 
-# --- NEW: AGROVET AUTH MODELS ---
 class AgrovetLoginRequest(BaseModel):
     till_number: str
 
@@ -249,16 +276,53 @@ async def apply_for_loan(request: LoanRequest, db: Session = Depends(get_db)):
         db.rollback()
         raise HTTPException(status_code=500, detail=str(e))
 
+# --- NEW: ACADEMY REWARD ENDPOINT ---
+@app.post("/api/v1/academy/complete", tags=["Academy"])
+async def complete_academy_module(request: AcademyCompletionRequest, db: Session = Depends(get_db)):
+    try:
+        user = db.query(FarmerDB).filter(FarmerDB.phone_number == request.phone_number).first()
+        if not user:
+            raise HTTPException(status_code=404, detail="Farmer not found")
+
+        # 1. Apply the Learn-to-Earn Rewards
+        # Cap the trust score at 100%
+        user.trust_score = min(user.trust_score + request.score_boost, 100.0)
+        user.approved_limit += request.limit_boost
+
+        # 2. Log the transaction as an "Education Bonus"
+        reward_ref = f"ACADEMY_{datetime.now().strftime('%Y%m%d%H%M%S')}"
+        new_tx = TransactionDB(
+            mpesa_receipt=reward_ref, 
+            farmer_phone=request.phone_number, 
+            till_number="OLETAI_ACADEMY", 
+            amount_kes=request.limit_boost, 
+            facility_fee=0
+        )
+        
+        db.add(new_tx)
+        db.commit()
+
+        print(f"🎓 Academy Reward Applied! {request.phone_number} earned {request.limit_boost} KES.")
+
+        return {
+            "status": "success", 
+            "new_score": user.trust_score,
+            "new_limit": user.approved_limit
+        }
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=str(e))
+
 @app.get("/api/v1/transactions/{phone_number}")
 async def get_transaction_history(phone_number: str, db: Session = Depends(get_db)):
     history = db.query(TransactionDB).filter(TransactionDB.farmer_phone == phone_number).order_by(TransactionDB.timestamp.desc()).all()
     return [
         {
             "id": tx.id,
-            "title": "Loan Repayment" if tx.till_number == "OLETAI_BANK" else f"Payment (Till {tx.till_number})",
+            "title": "Education Bonus" if tx.till_number == "OLETAI_ACADEMY" else ("Loan Repayment" if tx.till_number == "OLETAI_BANK" else f"Payment (Till {tx.till_number})"),
             "date": tx.timestamp.strftime("%b %d, %I:%M %p"),
-            "amount": f"{'+' if tx.till_number == 'OLETAI_BANK' else '-'} KES {tx.amount_kes}",
-            "is_credit": tx.till_number == "OLETAI_BANK"
+            "amount": f"{'+' if (tx.till_number == 'OLETAI_BANK' or tx.till_number == 'OLETAI_ACADEMY') else '-'} KES {tx.amount_kes}",
+            "is_credit": tx.till_number == "OLETAI_BANK" or tx.till_number == "OLETAI_ACADEMY"
         } for tx in history
     ]
 
@@ -320,7 +384,6 @@ async def get_active_agrovets(db: Session = Depends(get_db)):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-# --- NEW: AGROVET AUTHENTICATION ---
 @app.post("/api/v1/agrovets/login/send-otp", tags=["Agrovet Auth"])
 async def agrovet_send_otp(request: AgrovetLoginRequest, db: Session = Depends(get_db)):
     agrovet = db.query(AgrovetDB).filter(AgrovetDB.till_number == request.till_number).first()
@@ -441,8 +504,8 @@ async def get_agent_stats(phone_number: str, db: Session = Depends(get_db)):
         raise he 
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Stats Error: {str(e)}")
-   
-   # ==========================================
+    
+# ==========================================
 # OLETAI AI FARM ADVISOR (POWERED BY GEMINI)
 # ==========================================
 
@@ -462,15 +525,12 @@ async def chat_with_advisor(req: ChatRequest, db: Session = Depends(get_db)):
             return {"status": "error", "reply": "AI service is currently misconfigured."}
             
         # 1. FETCH LIVE CONTEXT FROM DATABASE
-        # We query the DB using the phone number passed in the ChatRequest
         farmer = db.query(FarmerDB).filter(FarmerDB.phone_number == req.farmer_phone).first()
         
-        # Determine current stats (or use defaults if the farmer isn't fully registered yet)
         trust_score = farmer.trust_score if farmer else "0 (New User)"
         buying_power = farmer.approved_limit if farmer else "0"
         
         # 2. BUILD THE DYNAMIC SYSTEM PROMPT
-        # Note how we use f-strings to inject the live DB data into the AI's brain
         dynamic_instruction = f"""
         You are the 'Oletai Farm Advisor', an expert agronomist operating in Kenya. 
         Your tone is professional and encouraging. Always refer to capital as an 'investment'.
@@ -486,7 +546,6 @@ async def chat_with_advisor(req: ChatRequest, db: Session = Depends(get_db)):
         """
         
         # 3. INITIALIZE THE MODEL WITH DYNAMIC INSTRUCTIONS
-        # We initialize the model here so every request gets a fresh context card
         ai_model = genai.GenerativeModel(
             model_name="gemini-2.5-flash",
             system_instruction=dynamic_instruction
@@ -500,20 +559,31 @@ async def chat_with_advisor(req: ChatRequest, db: Session = Depends(get_db)):
         print(f"🔥 GEMINI CRASH: {str(e)}")
         raise HTTPException(status_code=500, detail="AI Engine Error")
 
-# --- MULTIMODAL DIAGNOSIS ENDPOINT ---
+# --- UPDATED: MULTIMODAL DIAGNOSIS ENDPOINT (CLOUD STORAGE + GPS) ---
 @app.post("/api/v1/advisor/diagnose", tags=["AI Advisor"])
 async def diagnose_crop_issue(
     farmer_phone: str = Form(...),
-    image: UploadFile = File(...)
+    latitude: Optional[float] = Form(None),   
+    longitude: Optional[float] = Form(None),  
+    image: UploadFile = File(...),
+    db: Session = Depends(get_db)             
 ):
     try:
         if not GEMINI_API_KEY:
             return {"status": "error", "diagnosis": "AI service is currently misconfigured."}
 
-        # Read the image bytes from the upload
         image_bytes = await image.read()
         
-        # Prepare the Multimodal prompt for Gemini
+        # 1. UPLOAD IMAGE TO CLOUDINARY
+        secure_image_url = None
+        try:
+            upload_result = cloudinary.uploader.upload(image_bytes)
+            secure_image_url = upload_result.get("secure_url")
+            print(f"☁️ Image successfully uploaded to Cloudinary: {secure_image_url}")
+        except Exception as cloud_err:
+            print(f"⚠️ Warning: Cloudinary upload failed: {str(cloud_err)}")
+
+        # 2. ASK GEMINI FOR DIAGNOSIS
         prompt = """
         Analyze this image of a crop or livestock. 
         1. Identify the species if possible.
@@ -523,16 +593,32 @@ async def diagnose_crop_issue(
         Keep it professional and localized to Kenya.
         """
         
-        # Use a base model without user context for pure image diagnosis
         vision_model = genai.GenerativeModel(model_name="gemini-2.5-flash")
-        
-        # Call Gemini with both the image and the text prompt
         response = vision_model.generate_content([
             prompt,
             {"mime_type": image.content_type, "data": image_bytes}
         ])
         
-        return {"status": "success", "diagnosis": response.text}
+        diagnosis_result = response.text
+
+        # 3. SAVE THE COMPLETE RECORD TO POSTGRESQL
+        try:
+            new_diagnosis = AIDiagnosisDB(
+                farmer_phone=farmer_phone,
+                diagnosis_text=diagnosis_result,
+                latitude=latitude,
+                longitude=longitude,
+                image_url=secure_image_url 
+            )
+            db.add(new_diagnosis)
+            db.commit()
+            print(f"✅ Saved full AI Diagnosis record for {farmer_phone} to Database.")
+        except Exception as db_err:
+            db.rollback()
+            print(f"⚠️ Warning: Failed to save diagnosis to DB: {str(db_err)}")
+
+        return {"status": "success", "diagnosis": diagnosis_result}
+        
     except Exception as e:
         print(f"🔥 DIAGNOSIS CRASH: {str(e)}")
         raise HTTPException(status_code=500, detail="AI Diagnostic Error")
