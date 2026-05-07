@@ -648,7 +648,7 @@ async def diagnose_crop_issue(
         print(f"🔥 DIAGNOSIS CRASH: {str(e)}")
         raise HTTPException(status_code=500, detail="AI Diagnostic Error")
     
-    # ==========================================
+# ==========================================
 # 7. DIGITAL COOPERATIVES (COMMUNITY) ENDPOINTS
 # ==========================================
 class JoinCommunityRequest(BaseModel):
@@ -720,3 +720,29 @@ async def join_community(request: JoinCommunityRequest, db: Session = Depends(ge
     except Exception as e:
         db.rollback()
         raise HTTPException(status_code=500, detail=str(e))
+    
+# ==========================================
+# 8. INSTITUTIONAL RESEARCH PORTAL
+# ==========================================
+@app.get("/api/v1/research/map-data", tags=["Research Portal"])
+async def get_biosurveillance_data(db: Session = Depends(get_db)):
+    try:
+        # Fetch all AI diagnoses that successfully captured GPS coordinates
+        diagnoses = db.query(AIDiagnosisDB).filter(
+            AIDiagnosisDB.latitude.isnot(None),
+            AIDiagnosisDB.longitude.isnot(None)
+        ).order_by(AIDiagnosisDB.created_at.desc()).all()
+        
+        return [
+            {
+                "id": d.id,
+                "lat": d.latitude,
+                "lng": d.longitude,
+                "diagnosis": d.diagnosis_text[:100] + "..." if d.diagnosis_text else "Pending", # Snippet for the map pin
+                "image_url": d.image_url,
+                "date": d.created_at.strftime("%b %d, %Y")
+            } for d in diagnoses
+        ]
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    
