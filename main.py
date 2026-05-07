@@ -70,6 +70,22 @@ class FarmerDB(Base):
     country_code = Column(String, default="KE")
     base_currency = Column(String, default="KES")
     created_at = Column(DateTime, default=datetime.utcnow)
+    
+    # --- NEW: DIGITAL COOPERATIVE INTEGRATION ---
+    group_id = Column(Integer, index=True, nullable=True) # Links to FarmerGroupDB.id
+    is_group_leader = Column(Boolean, default=False)      # Flags if they are the hub-and-spoke trainer
+
+# --- NEW: FARMER COOPERATIVE GROUPS TABLE ---
+class FarmerGroupDB(Base):
+    __tablename__ = "farmer_groups"
+    id = Column(Integer, primary_key=True, index=True)
+    group_name = Column(String, index=True)             # e.g., "Juja Youth Poultry Co-op"
+    region = Column(String)                             # e.g., "Kiambu"
+    leader_phone = Column(String)                       # Phone number of the localized trainer/leader
+    collective_trust_score = Column(Float, default=0.0) # The group's multiplier based on collective repayment
+    member_count = Column(Integer, default=0)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    is_active = Column(Boolean, default=True)
 
 class TransactionDB(Base):
     __tablename__ = "transactions"
@@ -122,13 +138,22 @@ class AIDiagnosisDB(Base):
 
 Base.metadata.create_all(bind=engine)
 
+# ==========================================
+# AUTO-MIGRATIONS FOR DATABASE UPDATES
+# ==========================================
 try:
     with engine.connect() as conn:
+        # Existing Migrations
         conn.execute(text("ALTER TABLE transactions ADD COLUMN IF NOT EXISTS agent_phone VARCHAR"))
         conn.execute(text("ALTER TABLE agents ADD COLUMN IF NOT EXISTS commission_balance INTEGER DEFAULT 0"))
         conn.execute(text("ALTER TABLE agents ADD COLUMN IF NOT EXISTS total_sales_count INTEGER DEFAULT 0"))
         conn.execute(text("ALTER TABLE agents ADD COLUMN IF NOT EXISTS is_active BOOLEAN DEFAULT TRUE"))
         conn.execute(text("ALTER TABLE agents ADD COLUMN IF NOT EXISTS created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP"))
+        
+        # --- NEW COOPERATIVE MIGRATIONS ---
+        conn.execute(text("ALTER TABLE farmers ADD COLUMN IF NOT EXISTS group_id INTEGER"))
+        conn.execute(text("ALTER TABLE farmers ADD COLUMN IF NOT EXISTS is_group_leader BOOLEAN DEFAULT FALSE"))
+        
         conn.commit()
 except Exception as e:
     print(f"Migration Notice: {e}")
