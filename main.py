@@ -647,3 +647,76 @@ async def diagnose_crop_issue(
     except Exception as e:
         print(f"🔥 DIAGNOSIS CRASH: {str(e)}")
         raise HTTPException(status_code=500, detail="AI Diagnostic Error")
+    
+    # ==========================================
+# 7. DIGITAL COOPERATIVES (COMMUNITY) ENDPOINTS
+# ==========================================
+class JoinCommunityRequest(BaseModel):
+    phone_number: str
+    invite_code: str
+
+@app.get("/api/v1/community/status/{phone_number}", tags=["Community"])
+async def get_community_status(phone_number: str, db: Session = Depends(get_db)):
+    try:
+        farmer = db.query(FarmerDB).filter(FarmerDB.phone_number == phone_number).first()
+        if not farmer:
+            raise HTTPException(status_code=404, detail="Farmer not found")
+
+        # If they don't have a group ID, return false
+        if not farmer.group_id:
+            return {"has_group": False}
+
+        # If they do, fetch the group details
+        group = db.query(FarmerGroupDB).filter(FarmerGroupDB.id == farmer.group_id).first()
+        if not group:
+            return {"has_group": False}
+
+        return {
+            "has_group": True,
+            "group_name": group.group_name,
+            "region": group.region,
+            "member_count": group.member_count,
+            "collective_trust_score": group.collective_trust_score,
+            "leader_phone": group.leader_phone
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/api/v1/community/join", tags=["Community"])
+async def join_community(request: JoinCommunityRequest, db: Session = Depends(get_db)):
+    try:
+        farmer = db.query(FarmerDB).filter(FarmerDB.phone_number == request.phone_number).first()
+        if not farmer:
+            raise HTTPException(status_code=404, detail="Farmer not found")
+
+        # MVP Hack: Hardcode an invite code to auto-generate our test group
+        if request.invite_code.upper() == "GROW2026":
+            group = db.query(FarmerGroupDB).filter(FarmerGroupDB.group_name == "Nairobi Youth Poultry Co-op").first()
+            
+            # Create the group if it doesn't exist yet in the database
+            if not group:
+                group = FarmerGroupDB(
+                    group_name="Nairobi Youth Poultry Co-op",
+                    region="Nairobi, Kenya",
+                    leader_phone="0700000000",
+                    collective_trust_score=85.0,
+                    member_count=23 # Start at 23, the user joining makes it 24
+                )
+                db.add(group)
+                db.commit()
+                db.refresh(group)
+
+            # Assign farmer to the group and increment the count
+            farmer.group_id = group.id
+            group.member_count += 1
+            db.commit()
+
+            return {"status": "success", "message": f"Welcome to {group.group_name}!"}
+        else:
+            raise HTTPException(status_code=400, detail="Invalid Invite Code. Try GROW2026.")
+            
+    except HTTPException as he:
+        raise he
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=str(e))
